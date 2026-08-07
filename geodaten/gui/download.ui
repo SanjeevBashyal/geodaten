@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>DownloadWindow</class>
+ <widget class="QMainWindow" name="DownloadWindow">
+  <property name="geometry">
+   <rect><x>0</x><y>0</y><width>820</width><height>720</height></rect>
+  </property>
+  <property name="windowTitle"><string>geodaten</string></property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout">
+    <item>
+     <widget class="QScrollArea" name="scrollArea">
+      <property name="widgetResizable"><bool>true</bool></property>
+      <widget class="QWidget" name="scrollAreaWidgetContents">
+       <layout class="QFormLayout" name="formLayout">
+        <item row="0" column="0"><widget class="QLabel" name="datasetLabel"><property name="text"><string>Dataset</string></property></widget></item>
+        <item row="0" column="1"><widget class="QComboBox" name="datasetCombo"/></item>
+        <item row="1" column="0"><widget class="QLabel" name="variablesLabel"><property name="text"><string>Variables</string></property></widget></item>
+        <item row="1" column="1"><widget class="QLineEdit" name="variablesEdit"><property name="placeholderText"><string>Comma-separated variable identifiers</string></property></widget></item>
+        <item row="2" column="0"><widget class="QLabel" name="bboxLabel"><property name="text"><string>BBox W S E N</string></property></widget></item>
+        <item row="2" column="1"><widget class="QLineEdit" name="bboxEdit"><property name="text"><string>-180 -60 180 90</string></property></widget></item>
+        <item row="3" column="0"><widget class="QLabel" name="startLabel"><property name="text"><string>Start</string></property></widget></item>
+        <item row="3" column="1"><widget class="QLineEdit" name="startEdit"><property name="text"><string>earliest</string></property></widget></item>
+        <item row="4" column="0"><widget class="QLabel" name="endLabel"><property name="text"><string>End</string></property></widget></item>
+        <item row="4" column="1"><widget class="QLineEdit" name="endEdit"><property name="text"><string>latest</string></property></widget></item>
+        <item row="5" column="0"><widget class="QLabel" name="formatLabel"><property name="text"><string>Format</string></property></widget></item>
+        <item row="5" column="1">
+         <widget class="QComboBox" name="formatCombo">
+          <item><property name="text"><string>GeoTIFF</string></property><property name="userData"><string>tif</string></property></item>
+          <item><property name="text"><string>NetCDF</string></property><property name="userData"><string>netcdf</string></property></item>
+         </widget>
+        </item>
+        <item row="6" column="0"><widget class="QLabel" name="outputLabel"><property name="text"><string>Output directory</string></property></widget></item>
+        <item row="6" column="1">
+         <layout class="QHBoxLayout" name="outputLayout">
+          <item><widget class="QLineEdit" name="outputEdit"><property name="text"><string>geodaten-output</string></property></widget></item>
+          <item><widget class="QPushButton" name="browseButton"><property name="text"><string>Browse…</string></property></widget></item>
+         </layout>
+        </item>
+        <item row="7" column="0"><widget class="QLabel" name="workersLabel"><property name="text"><string>Provider workers</string></property></widget></item>
+        <item row="7" column="1"><widget class="QSpinBox" name="workersSpin"><property name="toolTip"><string>Provider concurrency hint; parallel execution is not guaranteed.</string></property><property name="minimum"><number>1</number></property><property name="maximum"><number>64</number></property><property name="value"><number>4</number></property></widget></item>
+        <item row="8" column="0"><widget class="QLabel" name="optionsLabel"><property name="text"><string>Provider options</string></property></widget></item>
+        <item row="8" column="1"><widget class="QLineEdit" name="optionsEdit"><property name="placeholderText"><string>key=value; key=value</string></property></widget></item>
+        <item row="9" column="0"><widget class="QLabel" name="authLabel"><property name="text"><string>Credentials</string></property></widget></item>
+        <item row="9" column="1">
+         <widget class="QWidget" name="credentialWidget" native="true">
+          <layout class="QFormLayout" name="credentialLayout"/>
+         </widget>
+        </item>
+        <item row="10" column="1">
+         <layout class="QHBoxLayout" name="flagsLayout">
+          <item><widget class="QCheckBox" name="overwriteCheck"><property name="text"><string>Overwrite</string></property></widget></item>
+          <item><widget class="QCheckBox" name="partialCheck"><property name="text"><string>Allow partial coverage</string></property></widget></item>
+         </layout>
+        </item>
+       </layout>
+      </widget>
+     </widget>
+    </item>
+    <item><widget class="QProgressBar" name="progressBar"><property name="value"><number>0</number></property></widget></item>
+    <item><widget class="QPlainTextEdit" name="logEdit"><property name="readOnly"><bool>true</bool></property></widget></item>
+    <item>
+     <layout class="QHBoxLayout" name="actionLayout">
+      <item><spacer name="horizontalSpacer"><property name="orientation"><enum>Qt::Horizontal</enum></property><property name="sizeHint" stdset="0"><size><width>40</width><height>20</height></size></property></spacer></item>
+      <item><widget class="QPushButton" name="planButton"><property name="text"><string>Plan</string></property></widget></item>
+      <item><widget class="QPushButton" name="downloadButton"><property name="text"><string>Download</string></property><property name="default"><bool>true</bool></property></widget></item>
+      <item><widget class="QPushButton" name="cancelButton"><property name="text"><string>Cancel</string></property><property name="enabled"><bool>false</bool></property></widget></item>
+     </layout>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
