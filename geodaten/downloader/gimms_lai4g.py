@@ -198,6 +198,7 @@ class GimmsLai4gProvider(Provider):
             "Global half-monthly leaf area index and quality-control fields at "
             "1/12-degree resolution."
         ),
+        group="LAI",
         variables=(
             VariableSpec(
                 "lai",

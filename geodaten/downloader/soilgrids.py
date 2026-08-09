@@ -93,6 +93,7 @@ class SoilGridsProvider(Provider):
             "Global ISRIC soil-property predictions at native 250 m resolution, "
             "read directly from public VRT mosaics."
         ),
+        group="Soil",
         variables=tuple(
             VariableSpec(
                 identifier,

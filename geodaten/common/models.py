@@ -134,6 +134,7 @@ class DatasetSpec:
     source_url: str = ""
     citation: str = ""
     license: str = ""
+    group: str = ""
 
     @property
     def variable_ids(self) -> tuple[str, ...]:

@@ -196,6 +196,7 @@ class GlcFcs30dProvider(Provider):
             "Global 30 m fine-classification land-cover observations at historical "
             "epochs and annually from 2000 to 2022."
         ),
+        group="Land Use",
         variables=(
             VariableSpec(
                 "land_cover",

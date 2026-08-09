@@ -180,6 +180,7 @@ class SrtmProvider(Provider):
             "Void-filled one arc-second Shuttle Radar Topography Mission elevation "
             "mosaicked and cropped to the requested extent."
         ),
+        group="Terrain",
         variables=(
             VariableSpec(
                 "elevation",

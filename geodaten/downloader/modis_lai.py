@@ -319,6 +319,7 @@ class ModisLaiProvider(Provider):
             "Native 500 m sinusoidal MODIS LAI, FPAR, uncertainty, and quality layers "
             "from Terra, Aqua, or their combined composites."
         ),
+        group="LAI",
         variables=tuple(
             VariableSpec(
                 id=identifier,

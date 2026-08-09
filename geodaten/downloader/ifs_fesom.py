@@ -1007,6 +1007,7 @@ class IfsFesomProvider(Provider):
         id="ifs_fesom",
         title="DestinE Climate DT IFS-FESOM Generation 2",
         summary="Hourly atmosphere and monthly climate fields from the coupled IFS-FESOM simulations.",
+        group="Climate",
         variables=tuple(
             VariableSpec(name, parameter.title, parameter.units, parameter.standard_name)
             for name, parameter in PARAMETERS.items()

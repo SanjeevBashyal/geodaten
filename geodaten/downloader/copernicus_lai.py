@@ -359,6 +359,7 @@ class CopernicusLaiProvider(Provider):
             "Ten-daily global leaf area index and supporting quality layers. "
             "Only requested windows are read from the official global COG assets."
         ),
+        group="LAI",
         variables=tuple(
             VariableSpec(
                 id=identifier,

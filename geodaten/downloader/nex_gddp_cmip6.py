@@ -414,6 +414,7 @@ class NexGddpProvider(Provider):
         id="nex_gddp_cmip6",
         title="NASA NEX-GDDP-CMIP6",
         summary="Daily, 0.25 degree statistically downscaled CMIP6 climate projections.",
+        group="Climate",
         variables=(
             VariableSpec("hurs", "Near-surface relative humidity", "%", "relative_humidity"),
             VariableSpec("huss", "Near-surface specific humidity", "1", "specific_humidity"),
