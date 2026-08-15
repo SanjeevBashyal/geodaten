@@ -1,4 +1,4 @@
-"""Memory-bounded writers for per-slice COGs and one request-level NetCDF."""
+"""Memory-bounded writers for per-slice COGs, one request-level NetCDF, and shapefiles."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import shutil
 import uuid
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -16,9 +17,16 @@ import rasterio
 from rasterio.windows import Window
 
 from geodaten.common.errors import OutputError
-from geodaten.common.gdal import translate_to_cog, validate_raster
+from geodaten.common.gdal import (
+    shapefile_members,
+    translate_to_cog,
+    validate_raster,
+    validate_vector,
+    vector_layers,
+    vector_to_shapefile,
+)
 from geodaten.common.io import safe_component
-from geodaten.common.models import BBox, DownloadRequest, RasterSlice
+from geodaten.common.models import BBox, DownloadRequest, RasterSlice, VectorSlice
 from geodaten.common.progress import CancellationToken, ProgressCallback, ProgressEvent, null_progress
 
 
@@ -532,12 +540,170 @@ class NetCDFWriter:
         self.partial.unlink(missing_ok=True)
 
 
+class ShapefileWriter:
+    """Install one cropped feature layer per variable as an ESRI Shapefile set."""
+
+    def __init__(
+        self,
+        request: DownloadRequest,
+        *,
+        progress: ProgressCallback = null_progress,
+        cancel: CancellationToken | None = None,
+    ) -> None:
+        self.request = request
+        self.root = output_root(request)
+        self.progress = progress
+        self.cancel = cancel
+        self.outputs: list[Path] = []
+        self.skipped = 0
+        self._staging: Path | None = None
+        self._installing: Path | None = None
+        self._written: set[Path] = set()
+
+    def _layer_path(self, variable: str) -> Path:
+        pieces = [safe_component(self.request.dataset), safe_component(variable)]
+        return self.root / ("_".join(pieces) + ".shp")
+
+    @staticmethod
+    def _members(target: Path) -> tuple[Path, ...]:
+        return tuple(path for path in shapefile_members(target) if path.is_file())
+
+    def resume_complete_request(self, expected_count: int | None) -> bool:
+        """Reuse only a complete, self-identifying shapefile set for this request.
+
+        One vector slice becomes several files, so completeness is decided by the
+        exact set of layers the request asks for rather than by a file count.
+        """
+
+        if (
+            self.request.overwrite
+            or _uses_latest(self.request)
+            or expected_count is None
+            or expected_count != len(self.request.variables)
+            or not self.root.is_dir()
+        ):
+            return False
+        expected = {
+            self._layer_path(variable): variable for variable in self.request.variables
+        }
+        if set(self.root.glob("*.shp")) != set(expected):
+            return False
+        reused: list[Path] = []
+        for path in expected:
+            if self.cancel:
+                self.cancel.check()
+            if path.is_symlink() or not validate_vector(path, cancel=self.cancel):
+                return False
+            reused.extend(self._members(path))
+
+        self.outputs.extend(reused)
+        self.skipped += len(expected)
+        self.progress(
+            ProgressEvent(
+                "output",
+                f"Reusing complete shapefile request ({len(expected)} layer(s))",
+                current=len(expected),
+                total=len(expected),
+            )
+        )
+        return True
+
+    def write(self, item: VectorSlice) -> Path:
+        if self.cancel:
+            self.cancel.check()
+        destination = self._layer_path(item.variable)
+        if destination in self._written:
+            raise OutputError(
+                f"Variable {item.variable!r} was written twice; one shapefile request "
+                "must produce one layer per variable"
+            )
+        self._written.add(destination)
+        if (
+            destination.exists()
+            and not self.request.overwrite
+            and not _uses_latest(self.request)
+            and validate_vector(destination, cancel=self.cancel)
+        ):
+            self.outputs.extend(self._members(destination))
+            self.skipped += 1
+            self.progress(ProgressEvent("output", f"Already complete: {destination.name}"))
+            return destination
+
+        self.progress(ProgressEvent("output", f"Writing {destination.name}"))
+        self.root.mkdir(parents=True, exist_ok=True)
+        # A shapefile layer is several files, so it is built in full beside the
+        # target and only then moved in, keeping a failed run from leaving a
+        # half-replaced set behind.
+        staging = self.root / f".{destination.stem}.{uuid.uuid4().hex}.part"
+        self._staging = staging
+        self._installing = destination
+        try:
+            staging.mkdir(parents=True)
+            staged = vector_to_shapefile(
+                item.source,
+                staging / destination.name,
+                layer=item.layer,
+                layer_name=destination.stem,
+                cancel=self.cancel,
+            )
+            if not validate_vector(staged, cancel=self.cancel):
+                raise OutputError(f"Generated shapefile failed validation: {destination.name}")
+            # Move in every sidecar the new layer has and drop any left over from
+            # an earlier run, so the installed set never mixes two conversions.
+            for path in shapefile_members(staged):
+                if self.cancel:
+                    self.cancel.check()
+                target = destination.parent / (destination.stem + path.suffix)
+                if path.is_file():
+                    os.replace(path, target)
+                else:
+                    target.unlink(missing_ok=True)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+            self._staging = None
+        self._installing = None
+
+        written = self._members(destination)
+        self.outputs.extend(written)
+        counts = vector_layers(destination, cancel=self.cancel)
+        features = next(iter(counts.values()), None) if counts else None
+        self.progress(
+            ProgressEvent(
+                "output",
+                f"Wrote {destination.name}"
+                + (f" ({features} features)" if features is not None else ""),
+            )
+        )
+        return destination
+
+    def close(self) -> tuple[Path, ...]:
+        if not self.outputs:
+            raise OutputError("Provider produced no vector layers")
+        return tuple(dict.fromkeys(self.outputs))
+
+    def abort(self) -> None:
+        if self._staging is not None:
+            shutil.rmtree(self._staging, ignore_errors=True)
+            self._staging = None
+        if self._installing is not None:
+            # An interrupted install can leave new and previous members side by
+            # side; no output at all is safer than a layer that mixes both.
+            for path in shapefile_members(self._installing):
+                path.unlink(missing_ok=True)
+            self._installing = None
+
+
+Writer = TiffWriter | NetCDFWriter | ShapefileWriter
+
+
 def make_writer(
     request: DownloadRequest,
     *,
     progress: ProgressCallback = null_progress,
     cancel: CancellationToken | None = None,
-) -> TiffWriter | NetCDFWriter:
+) -> Writer:
     if request.output_format.value == "tif":
         return TiffWriter(request, progress=progress, cancel=cancel)
+    if request.output_format.value == "shp":
+        return ShapefileWriter(request, progress=progress, cancel=cancel)
     return NetCDFWriter(request, progress=progress, cancel=cancel)

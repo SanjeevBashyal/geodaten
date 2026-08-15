@@ -55,12 +55,27 @@ def test_dataset_specs_match_the_designer_groups() -> None:
         "soilgrids": "Soil",
         "srtm": "Terrain",
         "glc_fcs30d": "Land Use",
+        "glim": "Geology",
         "gimms_lai4g": "LAI",
         "modis_lai": "LAI",
         "copernicus_lai": "LAI",
         "nex_gddp_cmip6": "Climate",
         "ifs_fesom": "Climate",
     }
+
+
+def test_every_dataset_group_exists_in_the_designer_form() -> None:
+    from geodaten.downloader.registry import provider_specs
+
+    form = resources.files("geodaten.gui").joinpath("download.ui")
+    root = ElementTree.fromstring(form.read_text(encoding="utf-8"))
+    combo = next(
+        element
+        for element in root.iter("widget")
+        if element.attrib.get("name") == "comboBox_datasetGroup"
+    )
+    designer_groups = {item.findtext("./property/string") for item in combo.iter("item")}
+    assert {spec.group for spec in provider_specs()} <= designer_groups
 
 
 def test_qt_controller_filters_datasets_and_builds_requests(monkeypatch) -> None:
@@ -115,8 +130,22 @@ def test_qt_controller_filters_datasets_and_builds_requests(monkeypatch) -> None
         options.close()
 
         window.comboBox_datasetGroup.setCurrentText("Geology")
-        assert window.datasetCombo.count() == 0
-        assert not window.downloadButton.isEnabled()
+        assert window.datasetCombo.currentData() == "glim"
+        assert not window.groupBox_temporalExtent.isEnabled()
+        assert tuple(
+            window.formatCombo.itemData(index)
+            for index in range(window.formatCombo.count())
+        ) == ("shp",)
+        window.variable_inputs["lithology"].setChecked(True)
+        vector_request = window._request()
+        assert vector_request.output_format.value == "shp"
+        assert vector_request.time is None
+
+        window.comboBox_datasetGroup.setCurrentText("Soil")
+        assert tuple(
+            window.formatCombo.itemData(index)
+            for index in range(window.formatCombo.count())
+        ) == ("tif", "netcdf")
     finally:
         window.close()
         application.processEvents()

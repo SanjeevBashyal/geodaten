@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +15,14 @@ from geodaten.common.errors import DependencyError, OutputError
 from geodaten.common.io import atomic_path
 from geodaten.common.models import BBox
 from geodaten.common.progress import CancellationToken
+
+#: Files an ESRI Shapefile layer is spread across; only ``.shp``/``.shx``/``.dbf``
+#: are mandatory, the rest are written whenever GDAL has something to record.
+SHAPEFILE_SIDECARS: tuple[str, ...] = (".shp", ".shx", ".dbf", ".prj", ".cpg")
+_REQUIRED_SIDECARS: tuple[str, ...] = (".shp", ".shx", ".dbf")
+
+_LAYER_NAME = re.compile(r"^Layer name:\s*(?P<name>.+?)\s*$")
+_FEATURE_COUNT = re.compile(r"^Feature Count:\s*(?P<count>-?\d+)\s*$")
 
 
 def require_commands(*commands: str) -> None:
@@ -97,6 +106,158 @@ def validate_raster(path: Path, *, bands: int | None = None) -> bool:
         return bool(metadata.get("coordinateSystem") or metadata.get("geoTransform"))
     except (OSError, OutputError, TypeError, ValueError):
         return False
+
+
+def vector_layers(
+    source: str | Path,
+    *,
+    layer: str | None = None,
+    env: Mapping[str, str] | None = None,
+    cancel: CancellationToken | None = None,
+) -> dict[str, int | None]:
+    """Return ``{layer name: feature count}`` for a GDAL-readable vector source.
+
+    ``ogrinfo`` summary text is parsed instead of ``-json`` because the JSON
+    output only exists from GDAL 3.7 onwards, while the wrappers here still
+    support the older releases handled by :func:`warp_to_cog`.
+    """
+
+    require_commands("ogrinfo")
+    command = ["ogrinfo", "-ro", "-so", "-nomd", str(source)]
+    command.append(layer if layer else "-al")
+    output = run(command, env=env, capture=True, cancel=cancel)
+    layers: dict[str, int | None] = {}
+    current: str | None = None
+    for line in output.splitlines():
+        name = _LAYER_NAME.match(line)
+        if name:
+            current = name.group("name")
+            layers.setdefault(current, None)
+            continue
+        count = _FEATURE_COUNT.match(line)
+        if count and current is not None:
+            value = int(count.group("count"))
+            layers[current] = value if value >= 0 else None
+    return layers
+
+
+def shapefile_members(
+    path: str | Path, *, extensions: Sequence[str] = SHAPEFILE_SIDECARS
+) -> tuple[Path, ...]:
+    """Return every sidecar path of one shapefile layer, present or not.
+
+    ``Path.with_suffix`` cannot be used because a layer name may legitimately
+    contain a dot, which would silently rewrite the wrong part of the name.
+    """
+
+    path = Path(path)
+    return tuple(path.parent / (path.stem + extension) for extension in extensions)
+
+
+def validate_vector(
+    source: Path,
+    *,
+    layer: str | None = None,
+    minimum_features: int = 1,
+    env: Mapping[str, str] | None = None,
+    cancel: CancellationToken | None = None,
+) -> bool:
+    """Return true only for a readable vector layer holding enough features.
+
+    An empty layer is structurally valid but is never a usable crop, so it is
+    rejected by default; a driver that cannot count cheaply reports ``None`` and
+    is accepted. A missing GDAL program is raised rather than reported as
+    invalid, so that a broken installation is not mistaken for stale output.
+    """
+
+    source = Path(source)
+    if source.suffix.lower() == ".shp":
+        if any(
+            not path.is_file() or path.stat().st_size == 0
+            for path in shapefile_members(source, extensions=_REQUIRED_SIDECARS)
+        ):
+            return False
+    elif not source.exists():
+        return False
+    try:
+        layers = vector_layers(source, layer=layer, env=env, cancel=cancel)
+    except (OSError, OutputError, ValueError):
+        return False
+    if layer is not None and layer not in layers:
+        return False
+    counts = [layers[layer]] if layer is not None else list(layers.values())
+    if not counts:
+        return False
+    return all(count is None or count >= minimum_features for count in counts)
+
+
+def vector_to_shapefile(
+    source: str | Path,
+    destination: Path,
+    *,
+    layer: str | None = None,
+    sql: str | None = None,
+    layer_name: str | None = None,
+    source_bounds: Sequence[float] | None = None,
+    clip_bbox: BBox | None = None,
+    target_crs: str | None = None,
+    geometry_type: str | None = None,
+    append: bool = False,
+    env: Mapping[str, str] | None = None,
+    cancel: CancellationToken | None = None,
+) -> Path:
+    """Convert one feature layer to an ESRI Shapefile, optionally cropping it.
+
+    ``source_bounds`` is an inexpensive prefilter expressed in the *source* CRS so
+    that a spatial index can be used, while ``clip_bbox`` performs the exact crop
+    in the destination CRS after reprojection. Callers that need an extent
+    crossing the antimeridian pass one non-crossing segment per call and set
+    ``append`` for every call after the first.
+    """
+
+    require_commands("ogr2ogr", "ogrinfo")
+    if clip_bbox is not None and clip_bbox.crosses_antimeridian:
+        raise OutputError("A single vector clip cannot cross the antimeridian")
+    if clip_bbox is not None and target_crs is None:
+        # ogr2ogr clips in the destination CRS, so a WGS84 extent applied to a
+        # projected source would silently select nothing.
+        raise OutputError("Clipping to a WGS84 extent requires an explicit target CRS")
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    command: list[str] = ["ogr2ogr", "-f", "ESRI Shapefile"]
+    command.extend(("-append",) if append else ("-overwrite",))
+    if target_crs is not None:
+        command.extend(("-t_srs", target_crs))
+    if source_bounds is not None:
+        if len(source_bounds) != 4:
+            raise OutputError("A source prefilter needs MINX MINY MAXX MAXY")
+        if source_bounds[0] >= source_bounds[2] or source_bounds[1] >= source_bounds[3]:
+            # ogr2ogr accepts an inverted rectangle and quietly selects its
+            # complement instead of reporting the mistake.
+            raise OutputError("A source prefilter needs MINX < MAXX and MINY < MAXY")
+        command.append("-spat")
+        command.extend(f"{float(value):.10g}" for value in source_bounds)
+    if clip_bbox is not None:
+        west, south, east, north = clip_bbox.as_tuple()
+        command.append("-clipdst")
+        command.extend(f"{value:.10g}" for value in (west, south, east, north))
+    if geometry_type is not None:
+        command.extend(("-nlt", geometry_type))
+    if layer_name is not None:
+        command.extend(("-nln", layer_name))
+    if not append:
+        command.extend(("-lco", "ENCODING=UTF-8"))
+    if sql is not None:
+        command.extend(("-sql", sql))
+    command.extend((str(destination), str(source)))
+    if sql is None and layer is not None:
+        command.append(layer)
+    run(command, env=env, cancel=cancel)
+    # A crop may legitimately select nothing from one segment, so only the layer's
+    # structure is checked here; callers decide whether an empty result is usable.
+    if not validate_vector(destination, minimum_features=0, env=env, cancel=cancel):
+        raise OutputError(f"Generated shapefile failed validation: {destination}")
+    return destination
 
 
 def build_vrt(

@@ -21,10 +21,16 @@ from textual.widgets import (
 )
 
 from geodaten.cli import parse_provider_options
-from geodaten.common.models import BBox, DownloadRequest, OutputFormat, TimeRange
+from geodaten.common.models import BBox, DatasetSpec, DownloadRequest, OutputFormat, TimeRange
 from geodaten.common.progress import CancellationToken, ProgressEvent
 from geodaten.downloader.registry import get_provider, provider_specs
 from geodaten.downloader.service import DownloadService
+
+_FORMAT_TITLES = {"tif": "GeoTIFF", "netcdf": "NetCDF", "shp": "ESRI Shapefile"}
+
+
+def _format_options(spec: DatasetSpec) -> list[tuple[str, str]]:
+    return [(_FORMAT_TITLES.get(value, value), value) for value in spec.format_ids]
 
 
 class GeodatenTui(App[None]):
@@ -68,8 +74,8 @@ class GeodatenTui(App[None]):
             with Horizontal(classes="row"):
                 yield Label("Format", classes="field-label")
                 yield Select(
-                    [("GeoTIFF", "tif"), ("NetCDF", "netcdf")],
-                    value="tif",
+                    _format_options(specs[0]),
+                    value=specs[0].format_ids[0],
                     id="format",
                     classes="field",
                 )
@@ -109,15 +115,25 @@ class GeodatenTui(App[None]):
             yield Input(value, placeholder=placeholder, id=identifier, classes="field")
 
     async def on_mount(self) -> None:
-        await self._refresh_credentials(str(self.query_one("#dataset", Select).value))
+        await self._apply_dataset(str(self.query_one("#dataset", Select).value))
 
     async def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "dataset" or event.value is Select.BLANK:
             return
-        spec = get_provider(str(event.value)).spec
-        self.query_one("#variables", Input).value = spec.variables[0].id
+        await self._apply_dataset(str(event.value), reset_variables=True)
+
+    async def _apply_dataset(self, dataset: str, *, reset_variables: bool = False) -> None:
+        """Let the selected dataset decide which inputs and formats are offered."""
+
+        spec = get_provider(dataset).spec
+        if reset_variables:
+            self.query_one("#variables", Input).value = spec.variables[0].id
         self.query_one("#start", Input).disabled = not spec.temporal
         self.query_one("#end", Input).disabled = not spec.temporal
+        formats = self.query_one("#format", Select)
+        current = formats.value
+        formats.set_options(_format_options(spec))
+        formats.value = current if current in spec.format_ids else spec.format_ids[0]
         await self._refresh_credentials(spec.id)
 
     async def _refresh_credentials(self, dataset: str) -> None:

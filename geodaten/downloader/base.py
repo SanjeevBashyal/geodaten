@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from geodaten.common.errors import ConfigurationError, DependencyError
-from geodaten.common.models import DatasetSpec, DownloadPlan, DownloadRequest, RasterSlice
+from geodaten.common.models import (
+    DatasetSpec,
+    DownloadPlan,
+    DownloadRequest,
+    RasterSlice,
+    VectorSlice,
+)
 from geodaten.common.progress import CancellationToken, ProgressCallback
 
 
@@ -20,6 +26,12 @@ class Provider(ABC):
         if request.dataset != self.spec.id:
             raise ConfigurationError(
                 f"Provider {self.spec.id!r} cannot handle dataset {request.dataset!r}"
+            )
+        if request.output_format not in self.spec.formats:
+            raise ConfigurationError(
+                f"Dataset {self.spec.id} cannot be written as "
+                f"{request.output_format.value!r}; choose from: "
+                + ", ".join(self.spec.format_ids)
             )
         unknown_variables = sorted(set(request.variables) - set(self.spec.variable_ids))
         if unknown_variables:
@@ -67,8 +79,12 @@ class Provider(ABC):
         workspace: Path,
         progress: ProgressCallback,
         cancel: CancellationToken,
-    ) -> Iterator[RasterSlice]:
-        """Yield one local, cropped, single-variable raster at a time."""
+    ) -> Iterator[RasterSlice | VectorSlice]:
+        """Yield one local, cropped payload at a time.
+
+        Raster providers yield a single-variable raster per logical slice; vector
+        providers yield one cropped feature layer per variable.
+        """
 
     def manifest_metadata(
         self, request: DownloadRequest, plan: DownloadPlan

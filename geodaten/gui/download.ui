@@ -272,6 +272,11 @@
           <string>NetCDF</string>
          </property>
         </item>
+        <item>
+         <property name="text">
+          <string>ESRI Shapefile</string>
+         </property>
+        </item>
        </widget>
       </item>
       <item>

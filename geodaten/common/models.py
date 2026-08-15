@@ -19,6 +19,11 @@ class OutputFormat(str, Enum):
 
     TIF = "tif"
     NETCDF = "netcdf"
+    SHP = "shp"
+
+
+RASTER_FORMATS: tuple[OutputFormat, ...] = (OutputFormat.TIF, OutputFormat.NETCDF)
+VECTOR_FORMATS: tuple[OutputFormat, ...] = (OutputFormat.SHP,)
 
 
 @dataclass(frozen=True)
@@ -129,6 +134,7 @@ class DatasetSpec:
     summary: str
     variables: tuple[VariableSpec, ...]
     temporal: bool = True
+    formats: tuple[OutputFormat, ...] = RASTER_FORMATS
     credentials: tuple[CredentialField, ...] = ()
     options: tuple[OptionSpec, ...] = ()
     source_url: str = ""
@@ -139,6 +145,10 @@ class DatasetSpec:
     @property
     def variable_ids(self) -> tuple[str, ...]:
         return tuple(variable.id for variable in self.variables)
+
+    @property
+    def format_ids(self) -> tuple[str, ...]:
+        return tuple(item.value for item in self.formats)
 
 
 def _json_value(value: Any) -> Any:
@@ -251,6 +261,21 @@ class RasterSlice:
     time: Any = None
     band: int = 1
     dimensions: Mapping[str, Any] = field(default_factory=dict)
+    attrs: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class VectorSlice:
+    """A local, GDAL-readable feature layer already cropped to the request extent.
+
+    Vector sources carry their own attribute table, so the payload is one layer
+    rather than one variable/time cell; ``attrs`` only records provenance that a
+    writer may attach to the final file set.
+    """
+
+    variable: str
+    source: str | Path
+    layer: str | None = None
     attrs: Mapping[str, Any] = field(default_factory=dict)
 
 

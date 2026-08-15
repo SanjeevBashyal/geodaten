@@ -41,6 +41,7 @@ from geodaten.downloader.service import DownloadService
 
 _ALIAS_DATE = QDate(1900, 1, 1)
 _VARIABLE_COLUMNS = 3
+_FORMAT_TITLES = {"tif": "GeoTIFF", "netcdf": "NetCDF", "shp": "ESRI Shapefile"}
 
 
 def _clear_layout(layout: Any) -> None:
@@ -222,8 +223,6 @@ class DownloadWindow(QMainWindow):
         self.variableLayout.setContentsMargins(0, 0, 0, 0)
         self.variableLayout.setSpacing(2)
         self.formatCombo.clear()
-        self.formatCombo.addItem("GeoTIFF", "tif")
-        self.formatCombo.addItem("NetCDF", "netcdf")
         for edit, value in (
             (self.dateEdit_startDate, self._concrete_dates["start"]),
             (self.dateEdit_endDate, self._concrete_dates["end"]),
@@ -276,10 +275,12 @@ class DownloadWindow(QMainWindow):
             self.credentialLayout.addRow(QLabel("Select an available dataset"))
             self.groupBox_temporalExtent.setEnabled(False)
             self.optionsButton.setEnabled(False)
+            self.formatCombo.clear()
             self._set_running(self._running, cancellable=self._cancellable)
             return
 
         spec = get_provider(str(identifier)).spec
+        self._refresh_formats(spec)
         for index, variable in enumerate(spec.variables):
             box = QCheckBox(variable.title, self.variableHostWidget)
             details = [f"Identifier: {variable.id}"]
@@ -314,6 +315,18 @@ class DownloadWindow(QMainWindow):
             self.credentialLayout.addRow(field.title, edit)
             self.credential_inputs[field.id] = edit
         self._set_running(self._running, cancellable=self._cancellable)
+
+    def _refresh_formats(self, spec: DatasetSpec) -> None:
+        """Offer only the output families the selected dataset can produce."""
+
+        previous = self.formatCombo.currentData()
+        blocked = self.formatCombo.blockSignals(True)
+        self.formatCombo.clear()
+        for value in spec.format_ids:
+            self.formatCombo.addItem(_FORMAT_TITLES.get(value, value), value)
+        restored = self.formatCombo.findData(previous)
+        self.formatCombo.setCurrentIndex(max(restored, 0))
+        self.formatCombo.blockSignals(blocked)
 
     def _toggle_date_alias(self, name: str, checked: bool) -> None:
         edit = self.dateEdit_startDate if name == "start" else self.dateEdit_endDate

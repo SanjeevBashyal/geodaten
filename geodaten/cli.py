@@ -86,7 +86,12 @@ def _add_request_arguments(parser: argparse.ArgumentParser) -> None:
         default=[],
         help="variable identifier; repeat for more than one",
     )
-    parser.add_argument("--format", choices=("tif", "netcdf"), default="tif")
+    parser.add_argument(
+        "--format",
+        choices=tuple(item.value for item in OutputFormat),
+        default=None,
+        help="output family; defaults to the first format the dataset supports",
+    )
     parser.add_argument("--output", type=Path, default=Path("geodaten-output"))
     parser.add_argument("--cache", type=Path)
     parser.add_argument(
@@ -159,7 +164,7 @@ def request_from_args(args: argparse.Namespace) -> DownloadRequest:
         bbox=BBox.from_values(args.bbox),
         time=temporal,
         variables=variables,
-        output_format=OutputFormat(args.format),
+        output_format=OutputFormat(args.format) if args.format else spec.formats[0],
         output_dir=args.output,
         cache_dir=args.cache,
         options=options,
@@ -203,6 +208,8 @@ def _doctor() -> int:
         "gdal_translate": shutil.which("gdal_translate") is not None,
         "gdalbuildvrt": shutil.which("gdalbuildvrt") is not None,
         "gdalwarp": shutil.which("gdalwarp") is not None,
+        "ogrinfo": shutil.which("ogrinfo") is not None,
+        "ogr2ogr": shutil.which("ogr2ogr") is not None,
         "requests": module_available("requests"),
         "rasterio": module_available("rasterio"),
         "pyproj": module_available("pyproj"),
@@ -224,6 +231,8 @@ def _doctor() -> int:
         "gdal_translate",
         "gdalbuildvrt",
         "gdalwarp",
+        "ogrinfo",
+        "ogr2ogr",
         "requests",
         "rasterio",
         "pyproj",

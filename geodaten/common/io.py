@@ -18,7 +18,18 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from geodaten.common.errors import DownloadError
+from geodaten.common.models import DownloadRequest
 from geodaten.common.progress import CancellationToken, ProgressCallback, ProgressEvent, null_progress
+
+
+def cache_root(request: DownloadRequest) -> Path:
+    """Return the staging root shared by the service and source-caching providers.
+
+    A provider that reuses one large monolithic source across requests writes it
+    below this directory so that only request scratch data is discarded.
+    """
+
+    return request.cache_dir or (request.output_dir / ".geodaten-cache")
 
 
 def safe_component(value: Any, *, fallback: str = "value") -> str:

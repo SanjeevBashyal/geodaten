@@ -7,10 +7,17 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
+from geodaten.common.io import cache_root
 from geodaten.common.manifest import write_manifest
 from geodaten.common.models import DownloadPlan, DownloadRequest, DownloadResult
 from geodaten.common.progress import CancellationToken, ProgressCallback, ProgressEvent, null_progress
-from geodaten.common.writers import NetCDFWriter, TiffWriter, make_writer, output_root
+from geodaten.common.writers import (
+    NetCDFWriter,
+    ShapefileWriter,
+    TiffWriter,
+    make_writer,
+    output_root,
+)
 from geodaten.downloader.registry import get_provider
 
 
@@ -64,17 +71,19 @@ class DownloadService:
         report(ProgressEvent("plan", f"Plan ready for {request.dataset}"))
         writer = make_writer(request, progress=report, cancel=token)
 
-        cache_root = request.cache_dir or (request.output_dir / ".geodaten-cache")
+        staging_root = cache_root(request)
         try:
-            tiff_complete = isinstance(writer, TiffWriter) and writer.resume_complete_request(
-                plan.slice_count
-            )
-            if not tiff_complete and (
+            # Per-file writers can prove a previous run already produced exactly
+            # this request and skip provider staging altogether.
+            reused_request = isinstance(
+                writer, (TiffWriter, ShapefileWriter)
+            ) and writer.resume_complete_request(plan.slice_count)
+            if not reused_request and (
                 not isinstance(writer, NetCDFWriter) or not writer.complete
             ):
-                cache_root.mkdir(parents=True, exist_ok=True)
+                staging_root.mkdir(parents=True, exist_ok=True)
                 with tempfile.TemporaryDirectory(
-                    prefix=f"{request.dataset}_", dir=cache_root
+                    prefix=f"{request.dataset}_", dir=staging_root
                 ) as temporary:
                     workspace = Path(temporary)
                     for item in provider.slices(request, workspace, report, token):
@@ -87,7 +96,7 @@ class DownloadService:
 
         root = output_root(request)
         root.mkdir(parents=True, exist_ok=True)
-        reused_complete_request = tiff_complete or (
+        reused_complete_request = reused_request or (
             isinstance(writer, NetCDFWriter) and writer.complete
         )
         if reused_complete_request:

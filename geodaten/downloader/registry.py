@@ -13,6 +13,7 @@ _BUILTINS: dict[str, tuple[str, str]] = {
     "soilgrids": ("geodaten.downloader.soilgrids", "SoilGridsProvider"),
     "srtm": ("geodaten.downloader.srtm", "SrtmProvider"),
     "glc_fcs30d": ("geodaten.downloader.glc_fcs30d", "GlcFcs30dProvider"),
+    "glim": ("geodaten.downloader.glim", "GlimProvider"),
     "gimms_lai4g": ("geodaten.downloader.gimms_lai4g", "GimmsLai4gProvider"),
     "modis_lai": ("geodaten.downloader.modis_lai", "ModisLaiProvider"),
     "copernicus_lai": ("geodaten.downloader.copernicus_lai", "CopernicusLaiProvider"),
