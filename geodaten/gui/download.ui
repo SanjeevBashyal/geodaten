@@ -80,6 +80,11 @@
              <string>Climate</string>
             </property>
            </item>
+           <item>
+            <property name="text">
+             <string>Imagery</string>
+            </property>
+           </item>
           </widget>
          </item>
          <item>

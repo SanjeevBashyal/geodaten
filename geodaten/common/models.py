@@ -265,6 +265,26 @@ class RasterSlice:
 
 
 @dataclass(frozen=True)
+class RasterBlock:
+    """A multiband raster whose consecutive bands represent several times."""
+
+    variable: str
+    source: str | Path
+    times: tuple[Any, ...]
+    band: int = 1
+    dimensions: Mapping[str, Any] = field(default_factory=dict)
+    attrs: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        times = tuple(self.times)
+        if not times:
+            raise ConfigurationError("A raster block requires at least one time")
+        if self.band < 1:
+            raise ConfigurationError("A raster block's first band must be at least one")
+        object.__setattr__(self, "times", times)
+
+
+@dataclass(frozen=True)
 class VectorSlice:
     """A local, GDAL-readable feature layer already cropped to the request extent.
 

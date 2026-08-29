@@ -13,6 +13,7 @@ from geodaten.common.models import (
     DatasetSpec,
     DownloadPlan,
     DownloadRequest,
+    RasterBlock,
     RasterSlice,
     VectorSlice,
 )
@@ -79,11 +80,11 @@ class Provider(ABC):
         workspace: Path,
         progress: ProgressCallback,
         cancel: CancellationToken,
-    ) -> Iterator[RasterSlice | VectorSlice]:
+    ) -> Iterator[RasterSlice | RasterBlock | VectorSlice]:
         """Yield one local, cropped payload at a time.
 
-        Raster providers yield a single-variable raster per logical slice; vector
-        providers yield one cropped feature layer per variable.
+        Raster providers yield a single logical slice or a multitime raster block;
+        vector providers yield one cropped feature layer per variable.
         """
 
     def manifest_metadata(

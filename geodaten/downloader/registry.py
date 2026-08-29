@@ -19,6 +19,9 @@ _BUILTINS: dict[str, tuple[str, str]] = {
     "copernicus_lai": ("geodaten.downloader.copernicus_lai", "CopernicusLaiProvider"),
     "nex_gddp_cmip6": ("geodaten.downloader.nex_gddp_cmip6", "NexGddpProvider"),
     "ifs_fesom": ("geodaten.downloader.ifs_fesom", "IfsFesomProvider"),
+    "era5_land": ("geodaten.downloader.era5_land", "Era5LandProvider"),
+    "sentinel2": ("geodaten.downloader.stac_imagery", "Sentinel2Provider"),
+    "landsat9": ("geodaten.downloader.stac_imagery", "Landsat9Provider"),
 }
 
 

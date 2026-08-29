@@ -36,6 +36,11 @@ destine = [
     "earthkit-regrid>=0.4",
     "scipy>=1.11",
 ]
+arco = [
+    "fsspec>=2024.2",
+    "xarray>=2024.2",
+    "zarr>=2.17,<3",
+]
 tui = ["textual>=1,<9"]
 gui = ["qtpy>=2.4"]
 gui-pyside6 = ["qtpy>=2.4", "PySide6>=6.7"]
@@ -44,10 +49,13 @@ all = [
     "earthaccess>=0.18",
     "earthkit-data[polytope]>=1.1",
     "earthkit-regrid>=0.4",
+    "fsspec>=2024.2",
     "qtpy>=2.4",
     "remotezip>=0.12",
     "scipy>=1.11",
     "textual>=1,<9",
+    "xarray>=2024.2",
+    "zarr>=2.17,<3",
 ]
 test = [
     "pytest>=7.4",

@@ -26,7 +26,13 @@ from geodaten.common.gdal import (
     vector_to_shapefile,
 )
 from geodaten.common.io import safe_component
-from geodaten.common.models import BBox, DownloadRequest, RasterSlice, VectorSlice
+from geodaten.common.models import (
+    BBox,
+    DownloadRequest,
+    RasterBlock,
+    RasterSlice,
+    VectorSlice,
+)
 from geodaten.common.progress import CancellationToken, ProgressCallback, ProgressEvent, null_progress
 
 
@@ -159,7 +165,7 @@ class TiffWriter:
         )
         return self.root / ("_".join(pieces) + ".tif")
 
-    def write(self, item: RasterSlice) -> Path:
+    def _write_slice(self, item: RasterSlice) -> Path:
         if self.cancel:
             self.cancel.check()
         destination = self._path(item)
@@ -195,6 +201,24 @@ class TiffWriter:
         )
         self.outputs.append(destination)
         return destination
+
+    def write(self, item: RasterSlice | RasterBlock) -> Path:
+        if isinstance(item, RasterSlice):
+            return self._write_slice(item)
+        output: Path | None = None
+        for offset, timestamp in enumerate(item.times):
+            output = self._write_slice(
+                RasterSlice(
+                    variable=item.variable,
+                    source=item.source,
+                    time=timestamp,
+                    band=item.band + offset,
+                    dimensions=item.dimensions,
+                    attrs=item.attrs,
+                )
+            )
+        assert output is not None
+        return output
 
     def close(self) -> tuple[Path, ...]:
         return tuple(dict.fromkeys(self.outputs))
@@ -398,9 +422,10 @@ class NetCDFWriter:
 
     def _create_data_variable(
         self,
-        item: RasterSlice,
+        item: RasterSlice | RasterBlock,
         source: rasterio.io.DatasetReader,
         dimensions: tuple[str, ...],
+        band: int,
     ) -> Any:
         name = _identifier(item.variable)
         if name in self.dataset.variables:
@@ -408,8 +433,8 @@ class NetCDFWriter:
                 raise OutputError(f"Dimensions changed for variable {name}")
             return self.dataset.variables[name]
 
-        dtype = np.dtype(source.dtypes[item.band - 1])
-        nodata = item.attrs.get("_FillValue", source.nodatavals[item.band - 1])
+        dtype = np.dtype(source.dtypes[band - 1])
+        nodata = item.attrs.get("_FillValue", source.nodatavals[band - 1])
         chunks = tuple(1 for _ in dimensions[:-2]) + (
             min(512, source.height),
             min(512, source.width),
@@ -429,10 +454,10 @@ class NetCDFWriter:
         variable.long_name = str(item.attrs.get("long_name", item.variable))
 
         attrs = dict(item.attrs)
-        if "scale_factor" not in attrs and source.scales[item.band - 1] != 1.0:
-            attrs["scale_factor"] = source.scales[item.band - 1]
-        if "add_offset" not in attrs and source.offsets[item.band - 1] != 0.0:
-            attrs["add_offset"] = source.offsets[item.band - 1]
+        if "scale_factor" not in attrs and source.scales[band - 1] != 1.0:
+            attrs["scale_factor"] = source.scales[band - 1]
+        if "add_offset" not in attrs and source.offsets[band - 1] != 0.0:
+            attrs["add_offset"] = source.offsets[band - 1]
         structural = {
             "_FillValue",
             "actual_max",
@@ -456,38 +481,64 @@ class NetCDFWriter:
         self._variables[name] = dimensions
         return variable
 
-    def write(self, item: RasterSlice) -> Path:
+    def write(self, item: RasterSlice | RasterBlock) -> Path:
         if self.complete:
             return self.target
         if self.cancel:
             self.cancel.check()
-        self.progress(ProgressEvent("output", f"Appending {item.variable} to NetCDF"))
+        blocked = isinstance(item, RasterBlock)
+        times = item.times if blocked else (() if item.time is None else (item.time,))
+        bands = (
+            tuple(range(item.band, item.band + len(item.times)))
+            if blocked
+            else (item.band,)
+        )
+        label = (
+            f"Appending {item.variable} block ({len(times)} times)"
+            if blocked
+            else f"Appending {item.variable} to NetCDF"
+        )
+        self.progress(ProgressEvent("output", label))
         try:
             source = rasterio.open(item.source)
         except Exception as exc:
             raise OutputError(f"Could not open raster slice {item.source}: {exc}") from exc
 
         with source:
-            if item.band < 1 or item.band > source.count:
-                raise OutputError(f"Band {item.band} does not exist in {item.source}")
+            if bands[0] < 1 or bands[-1] > source.count:
+                raise OutputError(
+                    f"Band range {bands[0]}..{bands[-1]} does not exist in {item.source}"
+                )
+            if any(source.dtypes[band - 1] != source.dtypes[bands[0] - 1] for band in bands):
+                raise OutputError("A raster time block cannot mix data types")
             if self.dataset is None:
                 self._open(source)
             else:
                 self._assert_grid(source)
 
             prefix_dimensions: list[str] = []
-            prefix_indices: list[int] = []
-            if item.time is not None:
+            prefix_indices: list[Any] = []
+            if times:
                 calendar = str(item.attrs.get("calendar", "proleptic_gregorian"))
                 prefix_dimensions.append("time")
-                prefix_indices.append(self._time_index(item.time, calendar))
+                indices = [self._time_index(value, calendar) for value in times]
+                contiguous = indices == list(range(indices[0], indices[0] + len(indices)))
+                if blocked:
+                    time_index: Any = (
+                        slice(indices[0], indices[-1] + 1)
+                        if contiguous
+                        else np.asarray(indices)
+                    )
+                else:
+                    time_index = indices[0]
+                prefix_indices.append(time_index)
             for name, value in sorted(item.dimensions.items()):
                 normalized = _identifier(name, "dimension")
                 prefix_dimensions.append(normalized)
                 prefix_indices.append(self._dimension_index(normalized, value))
 
             dimensions = tuple(prefix_dimensions) + ("y", "x")
-            variable = self._create_data_variable(item, source, dimensions)
+            variable = self._create_data_variable(item, source, dimensions, bands[0])
             block = 512
             total_blocks = math.ceil(source.height / block) * math.ceil(source.width / block)
             current = 0
@@ -498,7 +549,11 @@ class NetCDFWriter:
                     height = min(block, source.height - row)
                     width = min(block, source.width - column)
                     window = Window(column, row, width, height)
-                    data = source.read(item.band, window=window, masked=False)
+                    data = (
+                        source.read(bands, window=window, masked=False)
+                        if blocked
+                        else source.read(bands[0], window=window, masked=False)
+                    )
                     index = tuple(prefix_indices) + (
                         slice(row, row + height),
                         slice(column, column + width),
@@ -508,7 +563,7 @@ class NetCDFWriter:
                     self.progress(
                         ProgressEvent(
                             "output",
-                            f"Appending {item.variable}",
+                            label,
                             current=current,
                             total=total_blocks,
                         )

@@ -23,6 +23,7 @@ from geodaten.common.models import (
     DownloadRequest,
     OptionSpec,
     OutputFormat,
+    RasterBlock,
     RasterSlice,
     TimeRange,
 )
@@ -57,6 +58,25 @@ def source_raster(tmp_path: Path) -> Path:
         nodata=-9999,
     ) as destination:
         destination.write(np.arange(12, dtype="float32").reshape(3, 4), 1)
+    return path
+
+
+def source_raster_block(tmp_path: Path) -> Path:
+    path = tmp_path / "source-block.tif"
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=4,
+        height=3,
+        count=2,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=from_origin(10, 22, 0.5, 0.5),
+        nodata=-9999,
+    ) as destination:
+        destination.write(np.full((3, 4), 1, dtype="float32"), 1)
+        destination.write(np.full((3, 4), 2, dtype="float32"), 2)
     return path
 
 
@@ -190,6 +210,37 @@ def test_netcdf_writer_appends_time_slices_blockwise(tmp_path: Path) -> None:
         assert dataset.variables["x"].standard_name == "longitude"
         assert dataset.geospatial_bounds.startswith("POLYGON(")
         assert dataset.geospatial_bounds_crs == "EPSG:4326"
+
+
+def test_writers_expand_or_append_a_multitime_raster_block(tmp_path: Path) -> None:
+    source = source_raster_block(tmp_path)
+    block = RasterBlock(
+        "temperature",
+        source,
+        times=(date(2020, 1, 1), date(2020, 1, 2)),
+        attrs={"units": "K", "standard_name": "air_temperature"},
+    )
+
+    tiff_writer = TiffWriter(request(tmp_path / "tiff", OutputFormat.TIF))
+    tiff_writer.write(block)
+    tiff_outputs = tiff_writer.close()
+    assert len(tiff_outputs) == 2
+    with rasterio.open(tiff_outputs[0]) as first, rasterio.open(tiff_outputs[1]) as second:
+        assert np.all(first.read(1) == 1)
+        assert np.all(second.read(1) == 2)
+
+    events = []
+    netcdf_writer = NetCDFWriter(
+        request(tmp_path / "netcdf", OutputFormat.NETCDF), progress=events.append
+    )
+    netcdf_writer.write(block)
+    (netcdf_output,) = netcdf_writer.close()
+    assert all("block (2 times)" in event.message for event in events)
+    with netCDF4.Dataset(netcdf_output) as dataset:
+        values = dataset.variables["temperature"][:]
+        assert values.shape == (2, 3, 4)
+        assert np.all(values[0] == 1)
+        assert np.all(values[1] == 2)
 
 
 def test_invalid_netcdf_overwrite_preserves_previous_output(tmp_path: Path, monkeypatch) -> None:

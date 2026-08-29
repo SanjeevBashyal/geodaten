@@ -61,6 +61,9 @@ def test_dataset_specs_match_the_designer_groups() -> None:
         "copernicus_lai": "LAI",
         "nex_gddp_cmip6": "Climate",
         "ifs_fesom": "Climate",
+        "era5_land": "Climate",
+        "sentinel2": "Imagery",
+        "landsat9": "Imagery",
     }
 
 
@@ -108,7 +111,7 @@ def test_qt_controller_filters_datasets_and_builds_requests(monkeypatch) -> None
         assert tuple(
             window.datasetCombo.itemData(index)
             for index in range(window.datasetCombo.count())
-        ) == ("nex_gddp_cmip6", "ifs_fesom")
+        ) == ("nex_gddp_cmip6", "ifs_fesom", "era5_land")
         assert window.groupBox_temporalExtent.isEnabled()
         assert window.dateEdit_startDate.text() == "Earliest"
         assert window.dateEdit_endDate.text() == "Latest"

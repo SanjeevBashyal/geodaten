@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -42,6 +43,25 @@ from geodaten.downloader.service import DownloadService
 _ALIAS_DATE = QDate(1900, 1, 1)
 _VARIABLE_COLUMNS = 3
 _FORMAT_TITLES = {"tif": "GeoTIFF", "netcdf": "NetCDF", "shp": "ESRI Shapefile"}
+
+
+def state_path() -> Path:
+    """Return the saved-inputs file, overridable with ``GEODATEN_STATE``.
+
+    It lives in the user configuration directory rather than the working
+    directory because it holds credentials in the clear and must not be picked
+    up by a repository the user happens to launch the GUI from.
+    """
+
+    override = os.environ.get("GEODATEN_STATE")
+    if override:
+        return Path(override).expanduser()
+    root = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
+    return Path(root).expanduser() / "geodaten" / "geodaten.json"
+
+
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
 
 
 def _clear_layout(layout: Any) -> None:
@@ -209,6 +229,10 @@ class DownloadWindow(QMainWindow):
         self.variable_inputs: dict[str, QCheckBox] = {}
         self.credential_inputs: dict[str, QLineEdit] = {}
         self.provider_options: dict[str, dict[str, Any]] = {}
+        # Per-dataset selections survive switching datasets and restarts.
+        self.saved_variables: dict[str, list[str]] = {}
+        self.saved_credentials: dict[str, dict[str, str]] = {}
+        self._current_dataset: str | None = None
         self.thread: QThread | None = None
         self.worker: ServiceWorker | None = None
         self.token = CancellationToken()
@@ -252,6 +276,7 @@ class DownloadWindow(QMainWindow):
             self.comboBox_datasetGroup.setCurrentIndex(0)
         else:
             self._group_changed()
+        self.load_state()
 
     def _group_changed(self) -> None:
         group = self.comboBox_datasetGroup.currentText()
@@ -265,11 +290,15 @@ class DownloadWindow(QMainWindow):
         self._dataset_changed()
 
     def _dataset_changed(self) -> None:
+        # The outgoing dataset's widgets are about to be destroyed, so remember
+        # what was chosen in them before they go.
+        self._capture_dataset_state(self._current_dataset)
         _clear_layout(self.variableLayout)
         _clear_layout(self.credentialLayout)
         self.variable_inputs.clear()
         self.credential_inputs.clear()
         identifier = self.datasetCombo.currentData()
+        self._current_dataset = None if identifier is None else str(identifier)
         if identifier is None:
             self.variableLayout.addWidget(QLabel("No datasets are available in this group"), 0, 0)
             self.credentialLayout.addRow(QLabel("Select an available dataset"))
@@ -281,8 +310,10 @@ class DownloadWindow(QMainWindow):
 
         spec = get_provider(str(identifier)).spec
         self._refresh_formats(spec)
+        remembered = set(self.saved_variables.get(spec.id, ()))
         for index, variable in enumerate(spec.variables):
             box = QCheckBox(variable.title, self.variableHostWidget)
+            box.setChecked(variable.id in remembered)
             details = [f"Identifier: {variable.id}"]
             if variable.units:
                 details.append(f"Units: {variable.units}")
@@ -306,15 +337,138 @@ class DownloadWindow(QMainWindow):
         )
         if not spec.credentials:
             self.credentialLayout.addRow(QLabel("Public dataset; no credentials required"))
+        secrets = self.saved_credentials.get(spec.id, {})
         for field in spec.credentials:
             edit = QLineEdit(self.credentialWidget)
             edit.setPlaceholderText("Uses environment/config when left empty")
             edit.setToolTip(field.description)
+            edit.setText(str(secrets.get(field.id, "")))
             if field.secret:
                 edit.setEchoMode(QLineEdit.Password)
             self.credentialLayout.addRow(field.title, edit)
             self.credential_inputs[field.id] = edit
         self._set_running(self._running, cancellable=self._cancellable)
+
+    def _effective_date(self, name: str) -> QDate:
+        """Return the real date behind an Earliest/Latest alias."""
+
+        alias = self.checkBox_earliest if name == "start" else self.checkBox_latest
+        edit = self.dateEdit_startDate if name == "start" else self.dateEdit_endDate
+        return self._concrete_dates[name] if alias.isChecked() else edit.date()
+
+    def _capture_dataset_state(self, dataset: str | None = None) -> None:
+        """Fold the visible widgets back into the per-dataset stores."""
+
+        if dataset is None:
+            identifier = self.datasetCombo.currentData()
+            if identifier is None:
+                return
+            dataset = str(identifier)
+        self.saved_variables[dataset] = [
+            name for name, box in self.variable_inputs.items() if box.isChecked()
+        ]
+        secrets = {name: edit.text() for name, edit in self.credential_inputs.items() if edit.text()}
+        if secrets:
+            self.saved_credentials[dataset] = secrets
+        else:
+            self.saved_credentials.pop(dataset, None)
+
+    def save_state(self) -> Path | None:
+        """Write the current inputs so the next session starts where this one ended."""
+
+        self._capture_dataset_state()
+        state = {
+            "group": self.comboBox_datasetGroup.currentText(),
+            "dataset": self.datasetCombo.currentData(),
+            "longitude": self.lineEdit_longitudeExtent.text(),
+            "latitude": self.lineEdit_latitudeExtent.text(),
+            "earliest": self.checkBox_earliest.isChecked(),
+            "latest": self.checkBox_latest.isChecked(),
+            "start": self._effective_date("start").toString("yyyy-MM-dd"),
+            "end": self._effective_date("end").toString("yyyy-MM-dd"),
+            "format": self.formatCombo.currentData(),
+            "output_dir": self.outputEdit.text(),
+            "overwrite": self.overwriteCheck.isChecked(),
+            "allow_partial": self.partialCheck.isChecked(),
+            "variables": self.saved_variables,
+            "options": self.provider_options,
+            "credentials": self.saved_credentials,
+        }
+        path = state_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # Credentials are stored in the clear, so the file must never be
+            # group- or world-readable, including when it already existed.
+            handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(handle, "w", encoding="utf-8") as target:
+                json.dump(state, target, indent=2, sort_keys=True)
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            # Losing saved inputs must never take the download down with it.
+            self.logEdit.appendPlainText(f"Could not save {path}: {exc}")
+            return None
+        return path
+
+    def load_state(self) -> None:
+        """Restore the previous session's inputs, ignoring an unusable file."""
+
+        try:
+            state = json.loads(state_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(state, Mapping):
+            return
+
+        # Every nested container is checked: a hand-edited file must degrade to
+        # first-run defaults rather than stop the GUI from opening.
+        self.saved_variables = {
+            str(key): [str(name) for name in value]
+            for key, value in _mapping(state.get("variables")).items()
+            if isinstance(value, (list, tuple))
+        }
+        self.saved_credentials = {
+            str(key): {str(name): str(secret) for name, secret in value.items()}
+            for key, value in _mapping(state.get("credentials")).items()
+            if isinstance(value, Mapping)
+        }
+        self.provider_options = {
+            str(key): dict(value)
+            for key, value in _mapping(state.get("options")).items()
+            if isinstance(value, Mapping)
+        }
+        for name in ("start", "end"):
+            saved = QDate.fromString(str(state.get(name, "")), "yyyy-MM-dd")
+            if saved.isValid():
+                self._concrete_dates[name] = saved
+
+        # Nothing on screen was chosen by the user yet, so restoring must not
+        # capture the default widgets over the values just read from the file.
+        self._current_dataset = None
+        group = str(state.get("group") or "")
+        index = self.comboBox_datasetGroup.findText(group)
+        if index >= 0:
+            self.comboBox_datasetGroup.setCurrentIndex(index)
+        dataset = state.get("dataset")
+        if dataset is not None:
+            index = self.datasetCombo.findData(str(dataset))
+            if index >= 0:
+                self.datasetCombo.setCurrentIndex(index)
+        # The dataset drives which variable and credential widgets exist, so
+        # rebuild once more in case neither index actually changed.
+        self._dataset_changed()
+
+        output_format = state.get("format")
+        if output_format is not None:
+            index = self.formatCombo.findData(str(output_format))
+            if index >= 0:
+                self.formatCombo.setCurrentIndex(index)
+        self.lineEdit_longitudeExtent.setText(str(state.get("longitude") or ""))
+        self.lineEdit_latitudeExtent.setText(str(state.get("latitude") or ""))
+        self.outputEdit.setText(str(state.get("output_dir") or ""))
+        self.overwriteCheck.setChecked(bool(state.get("overwrite")))
+        self.partialCheck.setChecked(bool(state.get("allow_partial")))
+        self.checkBox_earliest.setChecked(bool(state.get("earliest", True)))
+        self.checkBox_latest.setChecked(bool(state.get("latest", True)))
 
     def _refresh_formats(self, spec: DatasetSpec) -> None:
         """Offer only the output families the selected dataset can produce."""
@@ -423,6 +577,7 @@ class DownloadWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Invalid request", str(exc))
             return
+        self.save_state()
         self.token = CancellationToken()
         self.thread = QThread(self)
         self.worker = ServiceWorker(request, mode, self.token)
@@ -478,6 +633,7 @@ class DownloadWindow(QMainWindow):
         self.logEdit.appendPlainText("Cancellation requested")
 
     def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API name
+        self.save_state()
         if self.thread is not None and self.thread.isRunning():
             self._close_after_work = True
             self.token.cancel()
