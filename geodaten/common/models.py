@@ -254,12 +254,16 @@ class DownloadPlan:
 
 @dataclass(frozen=True)
 class RasterSlice:
-    """A local or GDAL-readable, single-variable raster for one logical slice."""
+    """A local or GDAL-readable, single-variable raster for one logical slice.
+
+    ``band`` selects one band; ``None`` keeps every band, which a variable that
+    is itself a multiband composite (such as a red/green/blue image) needs.
+    """
 
     variable: str
     source: str | Path
     time: Any = None
-    band: int = 1
+    band: int | None = 1
     dimensions: Mapping[str, Any] = field(default_factory=dict)
     attrs: Mapping[str, Any] = field(default_factory=dict)
 

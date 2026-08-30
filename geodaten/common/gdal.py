@@ -265,9 +265,16 @@ def build_vrt(
     destination: Path,
     *,
     band: int | None = None,
+    separate: bool = False,
     env: Mapping[str, str] | None = None,
     cancel: CancellationToken | None = None,
 ) -> Path:
+    """Assemble sources into one VRT.
+
+    ``separate`` stacks each source as its own band instead of mosaicking them
+    side by side; every source must already share one grid.
+    """
+
     require_commands("gdalbuildvrt")
     if not sources:
         raise OutputError("Cannot build a mosaic without source rasters")
@@ -275,6 +282,8 @@ def build_vrt(
     source_list = destination.with_suffix(".sources.txt")
     source_list.write_text("".join(f"{source}\n" for source in sources), encoding="utf-8")
     command: list[str] = ["gdalbuildvrt", "-overwrite", "-resolution", "highest"]
+    if separate:
+        command.append("-separate")
     if band is not None:
         command.extend(("-b", str(band)))
     command.extend(("-input_file_list", str(source_list), str(destination)))
@@ -343,11 +352,12 @@ def translate_to_cog(
 
 
 def warp_to_cog(
-    source: str | Path,
+    source: str | Path | Sequence[str | Path],
     destination: Path,
     *,
     bbox: BBox,
     band: int | None = None,
+    shape: tuple[int, int] | None = None,
     metadata: Mapping[str, Any] | None = None,
     nodata: Any = None,
     scale: Any = None,
@@ -355,44 +365,60 @@ def warp_to_cog(
     env: Mapping[str, str] | None = None,
     cancel: CancellationToken | None = None,
 ) -> Path:
-    """Crop/reproject a source to the exact WGS84 extent through a lazy VRT.
+    """Crop/reproject one or more sources to the exact WGS84 extent via a lazy VRT.
 
     This avoids pre-GDAL-3.11 ``gdal_translate -projwin_srs`` corner-only
-    transforms for nonlinear source projections.
+    transforms for nonlinear source projections. Several sources are mosaicked
+    by ``gdalwarp`` itself, which unlike ``gdalbuildvrt`` reprojects each one, so
+    tiles spanning different projections merge instead of being dropped.
+
+    ``shape`` forces the output ``(width, height)``, which pins separate calls to
+    one identical grid so their results can later be stacked as bands.
     """
 
     require_commands("gdalwarp", "gdal_translate", "gdalinfo")
     if bbox.crosses_antimeridian:
         raise OutputError("A single GDAL crop cannot cross the antimeridian")
+    sources: tuple[str | Path, ...] = (
+        (source,) if isinstance(source, (str, Path)) else tuple(source)
+    )
+    if not sources:
+        raise OutputError("Cannot warp without a source raster")
     with tempfile.TemporaryDirectory(prefix="geodaten_warp_") as temporary:
         temporary_root = Path(temporary)
-        warp_source: str | Path = source
+        warp_sources: list[str | Path] = list(sources)
         if band is not None:
             # gdalwarp only gained -srcband/-b in GDAL 3.7. Select the band
             # through a lazy VRT first so older supported installations keep
             # the same bounded, streaming behavior.
-            selected = temporary_root / "selected-band.vrt"
-            run(
-                (
-                    "gdal_translate",
-                    "-q",
-                    "-of",
-                    "VRT",
-                    "-b",
-                    str(band),
-                    str(source),
-                    str(selected),
-                ),
-                env=env,
-                cancel=cancel,
-            )
-            warp_source = selected
-        vrt = temporary_root / "warped.vrt"
+            warp_sources = []
+            for index, item in enumerate(sources):
+                selected = temporary_root / f"selected-band-{index}.vrt"
+                run(
+                    (
+                        "gdal_translate",
+                        "-q",
+                        "-of",
+                        "VRT",
+                        "-b",
+                        str(band),
+                        str(item),
+                        str(selected),
+                    ),
+                    env=env,
+                    cancel=cancel,
+                )
+                warp_sources.append(selected)
+        # gdalwarp can only build a warped VRT around a single source, so a
+        # mosaic must land in a real raster first or every source but the first
+        # is silently dropped.
+        mosaicking = len(warp_sources) > 1
+        vrt = temporary_root / ("warped.tif" if mosaicking else "warped.vrt")
         command: list[str] = [
             "gdalwarp",
             "-overwrite",
             "-of",
-            "VRT",
+            "GTiff" if mosaicking else "VRT",
             "-t_srs",
             "EPSG:4326",
             "-te",
@@ -407,7 +433,12 @@ def warp_to_cog(
         ]
         if nodata is not None:
             command.extend(("-dstnodata", str(nodata)))
-        command.extend((str(warp_source), str(vrt)))
+        if shape is not None:
+            command.extend(("-ts", str(shape[0]), str(shape[1])))
+        if mosaicking:
+            command.extend(("-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER"))
+        command.extend(str(item) for item in warp_sources)
+        command.append(str(vrt))
         run(command, env=env, cancel=cancel)
         return translate_to_cog(
             vrt,

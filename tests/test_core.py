@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import threading
 import time
@@ -381,3 +382,55 @@ def test_copernicus_reference_credentials_are_empty() -> None:
     source = Path("codes-to-merge/download_copernicus_lai_v2.py").read_text()
     assert 'S3_ACCESS_KEY = ""' in source
     assert 'S3_SECRET_KEY = ""' in source
+
+
+def test_warp_mosaics_every_source_across_projections(tmp_path) -> None:
+    """A multi-source warp must merge all inputs, not just the first.
+
+    ``gdalwarp -of VRT`` silently warps only the first source, so a mosaic has
+    to land in a real raster; this covers the whole northern/southern pair.
+    """
+
+    from pyproj import Transformer
+
+    from geodaten.common.gdal import warp_to_cog
+
+    if shutil.which("gdalwarp") is None:  # pragma: no cover - environment dependent
+        pytest.skip("GDAL command-line tools are unavailable")
+
+    west, east = 11.9, 12.1
+    south, middle, north = 51.35, 51.45, 51.55
+    # Two halves of one extent, deliberately in different UTM zones.
+    halves = (("north", 32633, middle, north, 1), ("south", 32632, south, middle, 2))
+    sources = []
+    for name, epsg, lower, upper, value in halves:
+        to_utm = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
+        # A UTM rectangle's edges are not constant-latitude lines, so overshoot
+        # each half slightly to make sure it really covers up to the seam.
+        margin = 0.03
+        left, bottom = to_utm.transform(west - margin, lower - margin)
+        right, top = to_utm.transform(east + margin, upper + margin)
+        path = tmp_path / f"{name}.tif"
+        with rasterio.open(
+            path,
+            "w",
+            driver="GTiff",
+            width=128,
+            height=128,
+            count=1,
+            dtype="uint16",
+            crs=f"EPSG:{epsg}",
+            transform=from_bounds(left, bottom, right, top, 128, 128),
+            nodata=0,
+        ) as target:
+            target.write(np.full((128, 128), value, "uint16"), 1)
+        sources.append(path)
+
+    merged = tmp_path / "merged.tif"
+    warp_to_cog(sources, merged, bbox=BBox(west, south, east, north))
+    with rasterio.open(merged) as result:
+        data = result.read(1)
+    # Both source values must survive; only one would mean sources were dropped.
+    assert {1, 2} <= set(np.unique(data).tolist())
+    assert data[0, data.shape[1] // 2] == 1, "northern source missing from the mosaic"
+    assert data[-1, data.shape[1] // 2] == 2, "southern source missing from the mosaic"

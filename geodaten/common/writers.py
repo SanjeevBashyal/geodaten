@@ -127,7 +127,9 @@ class TiffWriter:
         for path in candidates:
             if self.cancel:
                 self.cancel.check()
-            if path.is_symlink() or not path.is_file() or not validate_raster(path, bands=1):
+            # A variable may be a multiband composite, so only require a
+            # readable raster here; the tags below establish identity.
+            if path.is_symlink() or not path.is_file() or not validate_raster(path):
                 return False
             try:
                 with rasterio.open(path) as source:
@@ -173,7 +175,7 @@ class TiffWriter:
             destination.exists()
             and not self.request.overwrite
             and not _uses_latest(self.request)
-            and validate_raster(destination, bands=1)
+            and validate_raster(destination, bands=1 if item.band is not None else None)
         ):
             self.outputs.append(destination)
             self.skipped += 1
@@ -487,6 +489,12 @@ class NetCDFWriter:
         if self.cancel:
             self.cancel.check()
         blocked = isinstance(item, RasterBlock)
+        if not blocked and item.band is None:
+            # A multiband composite has no single value per cell to store.
+            raise OutputError(
+                f"Variable {item.variable!r} is a multiband composite and cannot "
+                "be written as NetCDF; request the tif format instead"
+            )
         times = item.times if blocked else (() if item.time is None else (item.time,))
         bands = (
             tuple(range(item.band, item.band + len(item.times)))

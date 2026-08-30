@@ -16,6 +16,7 @@ from geodaten.downloader.stac_imagery import (
     SasTokens,
     Sentinel2Provider,
     gdal_environment,
+    group_by_date,
     item_datetime,
     resolve_date_window,
     search,
@@ -35,13 +36,14 @@ def item(
     baseline: str | None = "05.11",
     assets: tuple[str, ...] = ("B04", "B08", "SCL"),
     eo_cloud: float = 17.9,
+    tile: str = "33UUS",
     **properties: Any,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "datetime": when,
         "platform": "Sentinel-2C",
         "eo:cloud_cover": eo_cloud,
-        "s2:mgrs_tile": "33UUS",
+        "s2:mgrs_tile": tile,
         **properties,
     }
     if baseline is not None:
@@ -49,7 +51,10 @@ def item(
     return {
         "id": identifier,
         "properties": payload,
-        "assets": {name: {"href": HREF.replace("B04", name)} for name in assets},
+        "assets": {
+            name: {"href": HREF.replace("B04", name).replace("33UUS", tile)}
+            for name in assets
+        },
     }
 
 
@@ -313,14 +318,20 @@ def test_landsat_reflectance_and_thermal_carry_their_published_packing() -> None
     assert "scale_factor" not in provider.band_attrs("qa_pixel", {"properties": {}})
 
 
-def test_scene_labels_disambiguate_overlapping_footprints() -> None:
-    assert Sentinel2Provider().scene_label(item()) == "33UUS"
-    assert (
-        Landsat9Provider().scene_label(
-            {"id": "LC09", "properties": {"landsat:wrs_path": "194", "landsat:wrs_row": "024"}}
-        )
-        == "194024"
+def test_scenes_group_by_acquisition_date_not_by_timestamp() -> None:
+    """Landsat rows of one pass are seconds apart and must still merge."""
+
+    groups = group_by_date(
+        [
+            item("row025", when="2026-08-13T10:09:20Z"),
+            item("row024", when="2026-08-13T10:08:56Z"),
+            item("other", when="2026-08-22T10:02:46Z"),
+        ]
     )
+    assert list(groups) == [date(2026, 8, 13), date(2026, 8, 22)]
+    # Chronological within a date, so mosaic order is deterministic.
+    assert [entry["id"] for entry in groups[date(2026, 8, 13)]] == ["row024", "row025"]
+    assert [entry["id"] for entry in groups[date(2026, 8, 22)]] == ["other"]
 
 
 # --------------------------------------------------------------------------
@@ -375,7 +386,9 @@ def test_landsat_keeps_every_scene_whatever_the_cloud_cover(monkeypatch) -> None
     monkeypatch.setattr("geodaten.downloader.stac_imagery.make_session", FakeSession)
     plan = provider.plan(request("landsat9", variables=("red",)))
     assert calls == [None]
-    assert plan.period_count == 2
+    # Both fixtures share a date, so they merge into one output.
+    assert plan.period_count == 1
+    assert plan.details["scene_count"] == 2
     assert plan.details["max_cloud_cover"] is None
 
 
@@ -430,47 +443,186 @@ def test_an_empty_search_is_an_error_rather_than_an_empty_download(monkeypatch) 
         provider.plan(request("landsat9", variables=("red",)))
 
 
-def _stub_slices(monkeypatch, provider, items, tmp_path: Path) -> list[dict[str, Any]]:
-    """Run slices() without GDAL or the network, capturing each warp."""
+def _stub_slices(monkeypatch, provider, items, tmp_path: Path) -> dict[str, list[Any]]:
+    """Run slices() without GDAL or the network, capturing every GDAL call."""
 
-    calls: list[dict[str, Any]] = []
+    log: dict[str, list[Any]] = {"warp": [], "vrt": [], "run": []}
 
     def fake_warp(source, destination, **kwargs):
-        calls.append({"source": str(source), "destination": Path(destination), **kwargs})
+        sources = [str(value) for value in source] if isinstance(source, list) else [str(source)]
+        log["warp"].append(
+            {"sources": sources, "destination": Path(destination), **kwargs}
+        )
         Path(destination).parent.mkdir(parents=True, exist_ok=True)
         Path(destination).write_bytes(b"tif")
         return Path(destination)
 
+    def fake_build_vrt(sources, destination, **kwargs):
+        log["vrt"].append({"sources": [Path(s).name for s in sources], **kwargs})
+        Path(destination).write_bytes(b"vrt")
+        return Path(destination)
+
+    def fake_run(command, **kwargs):
+        command = [str(value) for value in command]
+        log["run"].append(command)
+        Path(command[-1]).write_bytes(b"vrt")
+        return ""
+
     monkeypatch.setattr("geodaten.downloader.stac_imagery.gdal.require_commands", lambda *a: None)
     monkeypatch.setattr("geodaten.downloader.stac_imagery.gdal.warp_to_cog", fake_warp)
+    monkeypatch.setattr("geodaten.downloader.stac_imagery.gdal.build_vrt", fake_build_vrt)
+    monkeypatch.setattr("geodaten.downloader.stac_imagery.gdal.run", fake_run)
+    monkeypatch.setattr(
+        "geodaten.downloader.stac_imagery.gdal.info", lambda *a, **k: {"size": [429, 429]}
+    )
     monkeypatch.setattr(provider, "_items_for", lambda _request: items)
     monkeypatch.setattr(
         "geodaten.downloader.stac_imagery.make_session",
         lambda: FakeSession(token={"token": "st=a", "msft:expiry": _expiry(60)}),
     )
-    return calls
+    return log
 
 
-def test_slices_crop_each_band_to_the_request_extent(monkeypatch, tmp_path: Path) -> None:
+#: The four tiles that really cover bbox 12.2,51.2 -> 12.6,51.5 on 2025-06-21,
+#: spanning EPSG:32632 and EPSG:32633.
+FOUR_TILES = (
+    item("a", tile="33UUT"),
+    item("b", tile="33UUS"),
+    item("c", tile="32UQC"),
+    item("d", tile="32UQB"),
+)
+
+
+def test_every_tile_of_one_date_merges_into_a_single_output(
+    monkeypatch, tmp_path: Path
+) -> None:
     provider = Sentinel2Provider()
-    calls = _stub_slices(monkeypatch, provider, (item("a"),), tmp_path)
+    log = _stub_slices(monkeypatch, provider, FOUR_TILES, tmp_path)
     ask = request(variables=("b04", "scl"))
     produced = list(provider.slices(ask, tmp_path, lambda _event: None, CancellationToken()))
 
+    # One slice per variable, not one per tile.
     assert [entry.variable for entry in produced] == ["b04", "scl"]
-    assert all(entry.time == datetime(2025, 6, 21, 10, 6, 11) for entry in produced)
-    assert all(entry.dimensions == {"tile": "33UUS"} for entry in produced)
-    assert [call["bbox"] for call in calls] == [ask.bbox, ask.bbox]
-    assert calls[0]["scale"] == 1e-4 and calls[0]["offset"] == -0.1
-    assert calls[1]["scale"] is None
-    assert calls[0]["metadata"]["scene"] == "a"
-    assert calls[0]["source"].startswith("/vsiaz/sentinel2-l2/")
-    assert calls[0]["source"].endswith("T33UUS_B04_10m.tif")
-    assert calls[1]["source"].endswith("T33UUS_SCL_10m.tif")
-    assert calls[0]["env"]["AZURE_STORAGE_SAS_TOKEN"] == "st=a"
-    assert calls[0]["env"]["AZURE_STORAGE_ACCOUNT"] == "sentinel2l2a01"
-    # Each staged window is removed once the writer has consumed it.
-    assert not any(call["destination"].exists() for call in calls)
+    assert all(entry.time == date(2025, 6, 21) for entry in produced)
+    assert all(entry.dimensions == {} for entry in produced)
+    assert all(entry.band == 1 for entry in produced)
+
+    assert len(log["warp"]) == 2
+    for call in log["warp"]:
+        assert call["bbox"] == ask.bbox
+        # All four tiles reach one gdalwarp, which reprojects across UTM zones.
+        assert len(call["sources"]) == 4
+        assert call["env"]["AZURE_STORAGE_ACCOUNT"] == "sentinel2l2a01"
+        assert call["env"]["AZURE_STORAGE_SAS_TOKEN"] == "st=a"
+    assert sorted(Path(s).name for s in log["warp"][0]["sources"]) == [
+        "T32UQB_B04_10m.tif",
+        "T32UQC_B04_10m.tif",
+        "T33UUS_B04_10m.tif",
+        "T33UUT_B04_10m.tif",
+    ]
+    assert log["warp"][0]["scale"] == 1e-4 and log["warp"][0]["offset"] == -0.1
+    assert log["warp"][1]["scale"] is None
+    assert log["warp"][0]["metadata"]["scene_count"] == 4
+    # Each staged mosaic is removed once the writer has consumed it.
+    assert not any(call["destination"].exists() for call in log["warp"])
+
+
+def test_separate_dates_stay_separate_outputs(monkeypatch, tmp_path: Path) -> None:
+    provider = Landsat9Provider()
+    scenes = (
+        item("row024", when="2026-08-13T10:08:56Z", assets=("red",)),
+        item("row025", when="2026-08-13T10:09:20Z", assets=("red",)),
+        item("later", when="2026-08-22T10:02:46Z", assets=("red",)),
+    )
+    log = _stub_slices(monkeypatch, provider, scenes, tmp_path)
+    produced = list(
+        provider.slices(
+            request("landsat9", variables=("red",)),
+            tmp_path,
+            lambda _event: None,
+            CancellationToken(),
+        )
+    )
+    assert [entry.time for entry in produced] == [date(2026, 8, 13), date(2026, 8, 22)]
+    # The two rows of one pass merge; the later date does not join them.
+    assert [len(call["sources"]) for call in log["warp"]] == [2, 1]
+
+
+def test_rgb_stacks_three_assets_onto_one_grid(monkeypatch, tmp_path: Path) -> None:
+    provider = Sentinel2Provider()
+    log = _stub_slices(
+        monkeypatch, provider, (item("a", assets=("B04", "B03", "B02")),), tmp_path
+    )
+    produced = list(
+        provider.slices(
+            request(variables=("rgb",)), tmp_path, lambda _e: None, CancellationToken()
+        )
+    )
+    (entry,) = produced
+    assert entry.variable == "rgb"
+    # None keeps every band, so the writer does not extract band 1.
+    assert entry.band is None
+    assert entry.time == date(2025, 6, 21)
+
+    assert [Path(call["sources"][0]).name for call in log["warp"]] == [
+        "T33UUS_B04_10m.tif",
+        "T33UUS_B03_10m.tif",
+        "T33UUS_B02_10m.tif",
+    ]
+    # The first merge sets the grid; the others are pinned to it so they stack.
+    assert log["warp"][0]["shape"] is None
+    assert [call["shape"] for call in log["warp"][1:]] == [(429, 429), (429, 429)]
+
+    assert log["vrt"] == [
+        {
+            "sources": ["component-0.tif", "component-1.tif", "component-2.tif"],
+            "separate": True,
+            "cancel": log["vrt"][0]["cancel"],
+        }
+    ]
+    (translate,) = log["run"]
+    assert translate[translate.index("-colorinterp") + 1] == "red,green,blue"
+
+
+def test_landsat_rgb_uses_its_own_asset_names(monkeypatch, tmp_path: Path) -> None:
+    provider = Landsat9Provider()
+    assert provider.bands["rgb"].stack == ("red", "green", "blue")
+    assert provider.bands["rgb"].assets == ("red", "green", "blue")
+    assert Sentinel2Provider().bands["b04"].assets == ("B04",)
+
+
+def test_a_group_spanning_storage_containers_is_refused(
+    monkeypatch, tmp_path: Path
+) -> None:
+    provider = Sentinel2Provider()
+    stray = item("stray")
+    stray["assets"]["B04"]["href"] = HREF.replace("sentinel2-l2/", "other-container/")
+    _stub_slices(monkeypatch, provider, (item("a"), stray), tmp_path)
+    with pytest.raises(DownloadError, match="several storage containers"):
+        list(
+            provider.slices(
+                request(variables=("b04",)), tmp_path, lambda _e: None, CancellationToken()
+            )
+        )
+
+
+def test_mixed_processing_baselines_warn_before_merging(
+    monkeypatch, tmp_path: Path
+) -> None:
+    provider = Sentinel2Provider()
+    scenes = (item("a", baseline="05.11"), item("b", tile="32UQB", baseline="03.01"))
+    _stub_slices(monkeypatch, provider, scenes, tmp_path)
+    events: list[ProgressEvent] = []
+    produced = list(
+        provider.slices(
+            request(variables=("b04",)), tmp_path, events.append, CancellationToken()
+        )
+    )
+    assert len(produced) == 1
+    assert any(
+        event.stage == "warning" and "03.01" in event.message and "05.11" in event.message
+        for event in events
+    )
 
 
 def test_a_missing_asset_stops_the_run_unless_partial_is_allowed(

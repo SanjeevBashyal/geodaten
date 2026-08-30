@@ -7,6 +7,7 @@ search/sign/warp path serves both: only the requested extent is transferred.
 from __future__ import annotations
 
 import re
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -46,6 +47,8 @@ _MAX_PAGES = 200
 _SEARCH_CACHE_SECONDS = 300.0
 #: Renew a signature before GDAL can trip over its expiry mid-transfer.
 _TOKEN_MARGIN = timedelta(minutes=5)
+#: GDAL colour interpretations for a composite, in band order.
+_COLOUR_INTERPRETATION = ("red", "green", "blue")
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,13 @@ class Band:
     scale: float | None = None
     offset: float | None = None
     description: str = ""
+    #: Assets composited into one multiband image, in band order. Empty for an
+    #: ordinary single-layer band.
+    stack: tuple[str, ...] = ()
+
+    @property
+    def assets(self) -> tuple[str, ...]:
+        return self.stack or (self.asset,)
 
 
 def _parse_boundary(value: str, *, end: bool, earliest: date) -> date:
@@ -106,6 +116,19 @@ def item_datetime(item: Mapping[str, Any]) -> datetime:
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed.replace(microsecond=0)
+
+
+def group_by_date(items: Sequence[Mapping[str, Any]]) -> dict[date, list[Mapping[str, Any]]]:
+    """Bucket scenes by acquisition date, in chronological order.
+
+    Tiles of one overpass are what must be merged, and Landsat numbers adjacent
+    WRS rows of a single pass seconds apart, so the timestamp cannot group them.
+    """
+
+    groups: dict[date, list[Mapping[str, Any]]] = {}
+    for item in sorted(items, key=item_datetime):
+        groups.setdefault(item_datetime(item).date(), []).append(item)
+    return groups
 
 
 def search(
@@ -237,10 +260,6 @@ class ImageryProvider(Provider):
     platform: str | None = None
     first_date: date = date(1972, 7, 23)
     bands: Mapping[str, Band] = {}
-    #: Item property (or properties) naming the scene footprint, kept in the
-    #: output name so overlapping scenes never collide.
-    scene_keys: tuple[str, ...] = ()
-    scene_dimension: str = "scene"
 
     def __init__(self) -> None:
         self._items: dict[str, tuple[float, tuple[dict[str, Any], ...]]] = {}
@@ -333,11 +352,6 @@ class ImageryProvider(Provider):
         self._items[request.fingerprint] = (monotonic(), items)
         return items
 
-    def scene_label(self, item: Mapping[str, Any]) -> str:
-        properties = item.get("properties") or {}
-        parts = [str(properties[key]) for key in self.scene_keys if properties.get(key) is not None]
-        return "".join(parts) or str(item.get("id", "scene"))
-
     def band_attrs(self, variable: str, item: Mapping[str, Any]) -> dict[str, Any]:
         band = self.bands[variable]
         attrs: dict[str, Any] = {"long_name": band.title, "units": band.units}
@@ -350,6 +364,7 @@ class ImageryProvider(Provider):
         self.validate(request)
         start, end = resolve_date_window(request, self.first_date)
         items = self._items_for(request)
+        groups = group_by_date(items)
         details: dict[str, Any] = {
             "start": start.isoformat(),
             "end": end.isoformat(),
@@ -358,21 +373,156 @@ class ImageryProvider(Provider):
             "max_cloud_cover": self.option(request, "max_cloud_cover"),
             "first_acquisition": item_datetime(items[0]).isoformat(),
             "last_acquisition": item_datetime(items[-1]).isoformat(),
-            "assets": tuple(self.bands[name].asset for name in request.variables),
+            "assets": tuple(
+                asset for name in request.variables for asset in self.bands[name].assets
+            ),
+            "scene_count": len(items),
+            # One merged output per date, however many tiles cover the extent.
+            "dates": tuple(day.isoformat() for day in groups),
             "payload_source": "COG",
         }
         if len(items) <= 50:
             details["scenes"] = tuple(str(item.get("id")) for item in items)
         return DownloadPlan(
             dataset=self.spec.id,
-            period_count=len(items),
-            slice_count=len(items) * len(request.variables),
+            period_count=len(groups),
+            slice_count=len(groups) * len(request.variables),
             # Every scene is read through range requests, so the transferred
             # size follows the extent rather than the catalogued scene size.
             estimated_bytes=None,
             details=details,
             warnings=("Actual transfer size depends on GDAL COG range requests.",),
         )
+
+    def _hrefs(
+        self,
+        group: Sequence[Mapping[str, Any]],
+        asset: str,
+        variable: str,
+        request: DownloadRequest,
+        progress: ProgressCallback,
+    ) -> list[str]:
+        """Collect one asset's href from every scene of a date group."""
+
+        hrefs: list[str] = []
+        for item in group:
+            href = str(((item.get("assets") or {}).get(asset) or {}).get("href") or "")
+            if href:
+                hrefs.append(href)
+                continue
+            identifier = str(item.get("id", "scene"))
+            if not request.allow_partial:
+                raise DownloadError(f"Scene {identifier} has no {variable} asset ({asset})")
+            progress(
+                ProgressEvent("warning", f"Missing {variable} for scene {identifier}")
+            )
+        containers = {SasTokens.container(href)[1] for href in hrefs}
+        if len(containers) > 1:
+            # One gdalwarp call carries a single container signature, so a split
+            # group would fail deep inside GDAL with an opaque auth error.
+            raise DownloadError(
+                f"{variable} for one date spans several storage containers "
+                f"({', '.join(sorted(containers))}); cannot merge them in one pass"
+            )
+        return hrefs
+
+    def _merge(
+        self,
+        hrefs: Sequence[str],
+        destination: Path,
+        request: DownloadRequest,
+        tokens: SasTokens,
+        cancel: CancellationToken,
+        *,
+        shape: tuple[int, int] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        scale: Any = None,
+        offset: Any = None,
+    ) -> Path:
+        """Reproject and mosaic every scene of a group into one raster."""
+
+        account, _ = SasTokens.container(hrefs[0])
+        return gdal.warp_to_cog(
+            [vsiaz(href) for href in hrefs],
+            destination,
+            bbox=request.bbox,
+            shape=shape,
+            metadata=metadata,
+            scale=scale,
+            offset=offset,
+            env=gdal_environment(account, tokens.token(hrefs[0])),
+            cancel=cancel,
+        )
+
+    def _compose(
+        self,
+        staging: Path,
+        group: Sequence[Mapping[str, Any]],
+        band: Band,
+        variable: str,
+        request: DownloadRequest,
+        tokens: SasTokens,
+        progress: ProgressCallback,
+        cancel: CancellationToken,
+        metadata: Mapping[str, Any],
+    ) -> Path:
+        """Stack several merged assets into one multiband image."""
+
+        components: list[Path] = []
+        shape: tuple[int, int] | None = None
+        for position, asset in enumerate(band.stack):
+            hrefs = self._hrefs(group, asset, variable, request, progress)
+            if not hrefs:
+                raise DownloadError(f"No {asset} asset available for {variable}")
+            component = staging / f"component-{position}.tif"
+            # The first merge sets the grid; the rest are pinned to it so the
+            # bands stack exactly.
+            self._merge(hrefs, component, request, tokens, cancel, shape=shape)
+            if shape is None:
+                size = gdal.info(component).get("size") or ()
+                if len(size) != 2:
+                    raise DownloadError(f"Could not read the merged size of {asset}")
+                shape = (int(size[0]), int(size[1]))
+            components.append(component)
+
+        stacked = staging / "stacked.vrt"
+        gdal.build_vrt(components, stacked, separate=True, cancel=cancel)
+        coloured = staging / "composite.vrt"
+        gdal.run(
+            (
+                "gdal_translate",
+                "-q",
+                "-of",
+                "VRT",
+                "-colorinterp",
+                ",".join(_COLOUR_INTERPRETATION[: len(components)]),
+                *(arg for key, value in metadata.items() if value is not None
+                  for arg in ("-mo", f"{str(key).upper()}={value}")),
+                str(stacked),
+                str(coloured),
+            ),
+            cancel=cancel,
+        )
+        return coloured
+
+    def _warn_mixed_baselines(
+        self, group: Sequence[Mapping[str, Any]], day: date, progress: ProgressCallback
+    ) -> None:
+        baselines = {
+            str((item.get("properties") or {}).get("s2:processing_baseline"))
+            for item in group
+            if (item.get("properties") or {}).get("s2:processing_baseline") is not None
+        }
+        if len(baselines) > 1:
+            # The -0.1 reflectance offset applies only from baseline 04.00, so a
+            # mixed group is radiometrically inconsistent once merged.
+            progress(
+                ProgressEvent(
+                    "warning",
+                    f"{day.isoformat()} merges processing baselines "
+                    f"{', '.join(sorted(baselines))}; reflectance offsets differ",
+                )
+            )
 
     def slices(
         self,
@@ -382,92 +532,95 @@ class ImageryProvider(Provider):
         cancel: CancellationToken,
     ) -> Iterator[RasterSlice]:
         self.validate(request)
-        gdal.require_commands("gdalwarp", "gdal_translate", "gdalinfo")
-        items = self._items_for(request)
+        gdal.require_commands("gdalwarp", "gdal_translate", "gdalinfo", "gdalbuildvrt")
+        groups = group_by_date(self._items_for(request))
         self._items.pop(request.fingerprint, None)
         session = make_session()
         tokens = SasTokens(session)
         slice_dir = workspace / "scenes"
         slice_dir.mkdir(parents=True, exist_ok=True)
-        total = len(items) * len(request.variables)
+        total = len(groups) * len(request.variables)
         current = 0
         produced = 0
 
         try:
-            for item in items:
+            for day, group in groups.items():
                 cancel.check()
-                identifier = str(item.get("id", "scene"))
-                timestamp = item_datetime(item)
-                label = self.scene_label(item)
-                assets = item.get("assets") or {}
+                self._warn_mixed_baselines(group, day, progress)
+                scenes = [str(item.get("id", "scene")) for item in group]
                 for variable in request.variables:
                     cancel.check()
                     current += 1
-                    asset = assets.get(self.bands[variable].asset) or {}
-                    href = str(asset.get("href") or "")
-                    if not href:
-                        if request.allow_partial:
-                            progress(
-                                ProgressEvent(
-                                    "warning",
-                                    f"Missing {variable} for scene {identifier}",
-                                    current=current,
-                                    total=total,
-                                )
-                            )
-                            continue
-                        raise DownloadError(
-                            f"Scene {identifier} has no {variable} asset "
-                            f"({self.bands[variable].asset})"
-                        )
+                    band = self.bands[variable]
+                    attrs = self.band_attrs(variable, group[0])
                     progress(
                         ProgressEvent(
                             "download",
-                            f"Reading {variable} window of {identifier}",
+                            f"Merging {variable} for {day.isoformat()} "
+                            f"from {len(group)} scene(s)",
                             current=current,
                             total=total,
                         )
                     )
-                    attrs = self.band_attrs(variable, item)
-                    destination = slice_dir / (
-                        f"{safe_component(identifier)}_{safe_component(variable)}.tif"
-                    )
-                    account, _ = SasTokens.container(href)
-                    gdal.warp_to_cog(
-                        vsiaz(href),
-                        destination,
-                        bbox=request.bbox,
-                        metadata={
-                            "dataset": self.spec.id,
-                            "variable": variable,
-                            "scene": identifier,
-                            "acquired": timestamp.isoformat(),
-                            "collection": self.collection,
-                            "platform": (item.get("properties") or {}).get("platform"),
-                            "cloud_cover": (item.get("properties") or {}).get("eo:cloud_cover"),
-                        },
-                        scale=attrs.get("scale_factor"),
-                        offset=attrs.get("add_offset"),
-                        env=gdal_environment(account, tokens.token(href)),
-                        cancel=cancel,
-                    )
-                    produced += 1
-                    try:
-                        # The staged window is request scratch data: the common
-                        # writer consumes one synchronously, then this frees it.
+                    metadata = {
+                        "dataset": self.spec.id,
+                        "variable": variable,
+                        "acquired": day.isoformat(),
+                        "collection": self.collection,
+                        "scenes": " ".join(scenes),
+                        "scene_count": len(scenes),
+                    }
+                    with tempfile.TemporaryDirectory(
+                        prefix="slice_", dir=slice_dir
+                    ) as temporary:
+                        staging = Path(temporary)
+                        if band.stack:
+                            source = self._compose(
+                                staging,
+                                group,
+                                band,
+                                variable,
+                                request,
+                                tokens,
+                                progress,
+                                cancel,
+                                metadata,
+                            )
+                            selected: int | None = None
+                        else:
+                            hrefs = self._hrefs(
+                                group, band.asset, variable, request, progress
+                            )
+                            if not hrefs:
+                                continue
+                            source = self._merge(
+                                hrefs,
+                                staging / "merged.tif",
+                                request,
+                                tokens,
+                                cancel,
+                                metadata=metadata,
+                                scale=attrs.get("scale_factor"),
+                                offset=attrs.get("add_offset"),
+                            )
+                            selected = 1
+                        produced += 1
+                        # The staged mosaic is request scratch data; the common
+                        # writer consumes it before this directory is removed.
                         yield RasterSlice(
                             variable=variable,
-                            source=destination,
-                            time=timestamp,
-                            dimensions={self.scene_dimension: label},
+                            source=source,
+                            time=day,
+                            band=selected,
                             attrs={
                                 **attrs,
-                                "source": f"Planetary Computer {self.collection} {identifier}",
+                                "source": (
+                                    f"Planetary Computer {self.collection}; "
+                                    f"{len(scenes)} scene(s)"
+                                ),
                                 "references": f"{STAC_URL}/collections/{self.collection}",
                             },
                         )
-                    finally:
-                        destination.unlink(missing_ok=True)
         finally:
             session.close()
         if not produced:
@@ -523,6 +676,16 @@ SENTINEL2_BANDS: dict[str, Band] = {
         "Scene classification map (20 m)",
         description="Categorical L2A scene classes; unscaled flag values.",
     ),
+    "rgb": Band(
+        "B04",
+        "True-colour image (red/green/blue, 10 m)",
+        scale=_S2_SCALE,
+        stack=("B04", "B03", "B02"),
+        description=(
+            "B04/B03/B02 stacked as one three-band image with red, green, and "
+            "blue colour interpretation, for display in GIS."
+        ),
+    ),
 }
 
 #: Collection 2 Level-2 packing published by USGS for surface reflectance and
@@ -547,6 +710,17 @@ LANDSAT9_BANDS: dict[str, Band] = {
         "Pixel quality assessment bitmask",
         description="Bit-packed cloud, shadow, snow, and water flags; unscaled.",
     ),
+    "rgb": Band(
+        "red",
+        "True-colour image (red/green/blue, 30 m)",
+        scale=2.75e-05,
+        offset=-0.2,
+        stack=("red", "green", "blue"),
+        description=(
+            "Red/green/blue stacked as one three-band image with matching "
+            "colour interpretation, for display in GIS."
+        ),
+    ),
 }
 
 
@@ -554,8 +728,6 @@ class Sentinel2Provider(ImageryProvider):
     collection = "sentinel-2-l2a"
     first_date = date(2015, 6, 27)
     bands = SENTINEL2_BANDS
-    scene_keys = ("s2:mgrs_tile",)
-    scene_dimension = "tile"
 
     spec = DatasetSpec(
         id="sentinel2",
@@ -595,8 +767,6 @@ class Landsat9Provider(ImageryProvider):
     #: dated 2021-10-31.
     first_date = date(2021, 10, 31)
     bands = LANDSAT9_BANDS
-    scene_keys = ("landsat:wrs_path", "landsat:wrs_row")
-    scene_dimension = "path_row"
 
     spec = DatasetSpec(
         id="landsat9",
@@ -621,6 +791,7 @@ class Landsat9Provider(ImageryProvider):
 __all__: Sequence[str] = (
     "Band",
     "ImageryProvider",
+    "group_by_date",
     "Landsat9Provider",
     "Sentinel2Provider",
     "SasTokens",
