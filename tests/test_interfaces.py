@@ -7,6 +7,7 @@ from xml.etree import ElementTree
 
 import pytest
 
+import geodaten.cli as cli_module
 from geodaten.cli import build_parser
 from geodaten.common.models import CredentialField, DatasetSpec, VariableSpec
 
@@ -16,6 +17,17 @@ def test_cli_exposes_all_interfaces() -> None:
     help_text = parser.format_help()
     for command in ("datasets", "info", "plan", "download", "doctor", "tui", "gui"):
         assert command in help_text
+
+
+def test_doctor_checks_that_modules_really_import(monkeypatch) -> None:
+    monkeypatch.setattr(cli_module, "import_module", lambda _name: object())
+    assert cli_module._module_available("present")
+
+    def fail(_name: str) -> object:
+        raise RuntimeError("broken transitive dependency")
+
+    monkeypatch.setattr(cli_module, "import_module", fail)
+    assert not cli_module._module_available("broken")
 
 
 def test_qt_designer_form_is_packaged_and_contains_download_inputs() -> None:
@@ -68,6 +80,8 @@ def test_dataset_specs_match_the_designer_groups() -> None:
         "modis_lai": "LAI",
         "copernicus_lai": "LAI",
         "era5_land": "Climate",
+        "chirps": "Climate",
+        "chirts_era5": "Climate",
         "nex_gddp_cmip6": "Climate",
         "sentinel2": "Imagery",
         "landsat9": "Imagery",
@@ -118,7 +132,7 @@ def test_qt_controller_filters_datasets_and_builds_requests(monkeypatch) -> None
         assert tuple(
             window.datasetCombo.itemData(index)
             for index in range(window.datasetCombo.count())
-        ) == ("era5_land", "nex_gddp_cmip6")
+        ) == ("era5_land", "chirps", "chirts_era5", "nex_gddp_cmip6")
         assert window.groupBox_temporalExtent.isEnabled()
         assert window.dateEdit_startDate.text() == "Earliest"
         assert window.dateEdit_endDate.text() == "Latest"

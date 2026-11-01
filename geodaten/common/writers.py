@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -14,6 +15,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import rasterio
+from rasterio.warp import transform_bounds
 from rasterio.windows import Window
 
 from geodaten.common.errors import OutputError
@@ -29,6 +31,7 @@ from geodaten.common.io import safe_component
 from geodaten.common.models import (
     BBox,
     DownloadRequest,
+    OUTPUT_SCHEMA_VERSION,
     RasterBlock,
     RasterSlice,
     VectorSlice,
@@ -36,15 +39,20 @@ from geodaten.common.models import (
 from geodaten.common.progress import CancellationToken, ProgressCallback, ProgressEvent, null_progress
 
 
-def output_root(request: DownloadRequest) -> Path:
-    return request.output_dir / request.dataset / request.fingerprint
-
-
 def _uses_latest(request: DownloadRequest) -> bool:
     return request.time is not None and any(
         str(value).strip().lower() == "latest"
         for value in (request.time.start, request.time.end)
     )
+
+
+def output_root(request: DownloadRequest, source_identity: str = "") -> Path:
+    fingerprint = request.fingerprint
+    if source_identity and not _uses_latest(request):
+        fingerprint = hashlib.sha256(
+            f"{fingerprint}\0{source_identity}".encode()
+        ).hexdigest()[:16]
+    return request.output_dir / request.dataset / fingerprint
 
 
 def _identifier(value: Any, fallback: str = "variable") -> str:
@@ -74,21 +82,16 @@ def _attribute(value: Any) -> Any:
     return value
 
 
-def _bounds_wkt(bbox: BBox) -> str:
-    rings = []
-    for segment in bbox.segments():
-        west, south, east, north = segment.as_tuple()
-        points = (
-            (west, south),
-            (east, south),
-            (east, north),
-            (west, north),
-            (west, south),
-        )
-        rings.append("(" + ", ".join(f"{x:g} {y:g}" for x, y in points) + ")")
-    if len(rings) == 1:
-        return "POLYGON(" + rings[0] + ")"
-    return "MULTIPOLYGON(" + ", ".join(f"({ring})" for ring in rings) + ")"
+def _bounds_wkt(bounds: tuple[float, float, float, float]) -> str:
+    west, south, east, north = bounds
+    points = (
+        (west, south),
+        (east, south),
+        (east, north),
+        (west, north),
+        (west, south),
+    )
+    return "POLYGON((" + ", ".join(f"{x:g} {y:g}" for x, y in points) + "))"
 
 
 class TiffWriter:
@@ -96,15 +99,42 @@ class TiffWriter:
         self,
         request: DownloadRequest,
         *,
+        source_identity: str = "",
         progress: ProgressCallback = null_progress,
         cancel: CancellationToken | None = None,
     ) -> None:
         self.request = request
-        self.root = output_root(request)
+        self.source_identity = source_identity
+        self.root = output_root(request, source_identity)
         self.progress = progress
         self.cancel = cancel
         self.outputs: list[Path] = []
         self.skipped = 0
+
+    def _matches_request(
+        self,
+        path: Path,
+        *,
+        variable: str | None = None,
+        bands: int | None = None,
+    ) -> bool:
+        if path.is_symlink() or not path.is_file() or not validate_raster(path, bands=bands):
+            return False
+        try:
+            with rasterio.open(path) as source:
+                tags = {key.upper(): str(value) for key, value in source.tags().items()}
+        except (OSError, rasterio.errors.RasterioError):
+            return False
+        return (
+            tags.get("DATASET") == self.request.dataset
+            and tags.get("REQUEST_FINGERPRINT") == self.request.fingerprint
+            and tags.get("OUTPUT_NAME") == path.name
+            and tags.get("OUTPUT_SCHEMA") == str(OUTPUT_SCHEMA_VERSION)
+            and tags.get("SOURCE_IDENTITY", "") == self.source_identity
+            and tags.get("VARIABLE")
+            == (variable if variable is not None else tags.get("VARIABLE"))
+            and tags.get("VARIABLE") in self.request.variables
+        )
 
     def resume_complete_request(self, expected_count: int | None) -> bool:
         """Reuse only a complete, self-identifying request-level TIFF set."""
@@ -127,21 +157,7 @@ class TiffWriter:
         for path in candidates:
             if self.cancel:
                 self.cancel.check()
-            # A variable may be a multiband composite, so only require a
-            # readable raster here; the tags below establish identity.
-            if path.is_symlink() or not path.is_file() or not validate_raster(path):
-                return False
-            try:
-                with rasterio.open(path) as source:
-                    tags = {key.upper(): str(value) for key, value in source.tags().items()}
-            except (OSError, rasterio.errors.RasterioError):
-                return False
-            if (
-                tags.get("DATASET") != self.request.dataset
-                or tags.get("REQUEST_FINGERPRINT") != self.request.fingerprint
-                or tags.get("OUTPUT_NAME") != path.name
-                or tags.get("VARIABLE") not in self.request.variables
-            ):
+            if not self._matches_request(path):
                 return False
 
         self.outputs.extend(candidates)
@@ -175,7 +191,11 @@ class TiffWriter:
             destination.exists()
             and not self.request.overwrite
             and not _uses_latest(self.request)
-            and validate_raster(destination, bands=1 if item.band is not None else None)
+            and self._matches_request(
+                destination,
+                variable=item.variable,
+                bands=1 if item.band is not None else None,
+            )
         ):
             self.outputs.append(destination)
             self.skipped += 1
@@ -185,6 +205,8 @@ class TiffWriter:
         metadata = {
             "dataset": self.request.dataset,
             "request_fingerprint": self.request.fingerprint,
+            "output_schema": OUTPUT_SCHEMA_VERSION,
+            "source_identity": self.source_identity,
             "output_name": destination.name,
             "variable": item.variable,
             "time": item.time.isoformat() if hasattr(item.time, "isoformat") else item.time,
@@ -236,11 +258,13 @@ class NetCDFWriter:
         self,
         request: DownloadRequest,
         *,
+        source_identity: str = "",
         progress: ProgressCallback = null_progress,
         cancel: CancellationToken | None = None,
     ) -> None:
         self.request = request
-        self.root = output_root(request)
+        self.source_identity = source_identity
+        self.root = output_root(request, source_identity)
         self.target = self.root / f"{safe_component(request.dataset)}_{request.fingerprint}.nc"
         self.partial = self.target.with_name(
             f".{self.target.name}.{uuid.uuid4().hex}.part"
@@ -255,7 +279,7 @@ class NetCDFWriter:
         self._coordinate_indices: dict[str, dict[str, int]] = {}
         self._time_calendar: str | None = None
         self.complete = (
-            self._is_complete(self.target)
+            self._matches_request(self.target)
             and not request.overwrite
             and not _uses_latest(request)
         )
@@ -281,6 +305,27 @@ class NetCDFWriter:
         except Exception:
             return False
 
+    def _matches_request(self, path: Path) -> bool:
+        if not self._is_complete(path):
+            return False
+        try:
+            from netCDF4 import Dataset
+
+            with Dataset(path) as dataset:
+                return (
+                    str(getattr(dataset, "source", "")) == self.request.dataset
+                    and str(getattr(dataset, "request_fingerprint", ""))
+                    == self.request.fingerprint
+                    and str(getattr(dataset, "output_name", "")) == self.target.name
+                    and int(getattr(dataset, "output_schema", -1)) == OUTPUT_SCHEMA_VERSION
+                    and str(getattr(dataset, "source_identity", ""))
+                    == self.source_identity
+                    and str(getattr(dataset, "variables_requested", ""))
+                    == json.dumps(list(self.request.variables), separators=(",", ":"))
+                )
+        except Exception:
+            return False
+
     def _open(self, source: rasterio.io.DatasetReader) -> None:
         from netCDF4 import Dataset
 
@@ -293,11 +338,20 @@ class NetCDFWriter:
         dataset.title = f"{self.request.dataset} spatial and temporal subset"
         dataset.source = self.request.dataset
         dataset.history = f"{datetime.now(UTC).isoformat(timespec='seconds')} created by geodaten"
-        dataset.geospatial_bounds = _bounds_wkt(self.request.bbox)
+        bounds = transform_bounds(source.crs, "EPSG:4326", *source.bounds, densify_pts=21)
+        dataset.geospatial_bounds = _bounds_wkt(bounds)
         dataset.geospatial_bounds_crs = "EPSG:4326"
-        dataset.geospatial_lat_min = self.request.bbox.south
-        dataset.geospatial_lat_max = self.request.bbox.north
+        dataset.geospatial_lon_min = bounds[0]
+        dataset.geospatial_lat_min = bounds[1]
+        dataset.geospatial_lon_max = bounds[2]
+        dataset.geospatial_lat_max = bounds[3]
         dataset.request_fingerprint = self.request.fingerprint
+        dataset.output_schema = OUTPUT_SCHEMA_VERSION
+        dataset.source_identity = self.source_identity
+        dataset.output_name = self.target.name
+        dataset.variables_requested = json.dumps(
+            list(self.request.variables), separators=(",", ":")
+        )
         dataset.createDimension("y", source.height)
         dataset.createDimension("x", source.width)
 
@@ -587,7 +641,7 @@ class NetCDFWriter:
         self.dataset.close()
         self.dataset = None
         self.target.parent.mkdir(parents=True, exist_ok=True)
-        if not self._is_complete(self.partial):
+        if not self._matches_request(self.partial):
             self.partial.unlink(missing_ok=True)
             raise OutputError("Generated NetCDF failed validation")
         os.replace(self.partial, self.target)
@@ -610,11 +664,13 @@ class ShapefileWriter:
         self,
         request: DownloadRequest,
         *,
+        source_identity: str = "",
         progress: ProgressCallback = null_progress,
         cancel: CancellationToken | None = None,
     ) -> None:
         self.request = request
-        self.root = output_root(request)
+        self.source_identity = source_identity
+        self.root = output_root(request, source_identity)
         self.progress = progress
         self.cancel = cancel
         self.outputs: list[Path] = []
@@ -762,11 +818,27 @@ Writer = TiffWriter | NetCDFWriter | ShapefileWriter
 def make_writer(
     request: DownloadRequest,
     *,
+    source_identity: str = "",
     progress: ProgressCallback = null_progress,
     cancel: CancellationToken | None = None,
 ) -> Writer:
     if request.output_format.value == "tif":
-        return TiffWriter(request, progress=progress, cancel=cancel)
+        return TiffWriter(
+            request,
+            source_identity=source_identity,
+            progress=progress,
+            cancel=cancel,
+        )
     if request.output_format.value == "shp":
-        return ShapefileWriter(request, progress=progress, cancel=cancel)
-    return NetCDFWriter(request, progress=progress, cancel=cancel)
+        return ShapefileWriter(
+            request,
+            source_identity=source_identity,
+            progress=progress,
+            cancel=cancel,
+        )
+    return NetCDFWriter(
+        request,
+        source_identity=source_identity,
+        progress=progress,
+        cancel=cancel,
+    )

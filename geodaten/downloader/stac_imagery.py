@@ -6,6 +6,8 @@ search/sign/warp path serves both: only the requested extent is transferred.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import tempfile
 from collections.abc import Iterator
@@ -383,6 +385,26 @@ class ImageryProvider(Provider):
         }
         if len(items) <= 50:
             details["scenes"] = tuple(str(item.get("id")) for item in items)
+        inventory = [
+            {
+                "id": str(item.get("id", "")),
+                "datetime": item_datetime(item).isoformat(),
+                "baseline": str(
+                    (item.get("properties") or {}).get("s2:processing_baseline", "")
+                ),
+                "assets": {
+                    asset: str(
+                        ((item.get("assets") or {}).get(asset) or {}).get("href", "")
+                    )
+                    for name in request.variables
+                    for asset in self.bands[name].assets
+                },
+            }
+            for item in items
+        ]
+        source_identity = "stac:" + hashlib.sha256(
+            json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
         return DownloadPlan(
             dataset=self.spec.id,
             period_count=len(groups),
@@ -392,6 +414,7 @@ class ImageryProvider(Provider):
             estimated_bytes=None,
             details=details,
             warnings=("Actual transfer size depends on GDAL COG range requests.",),
+            source_identity=source_identity,
         )
 
     def _hrefs(
@@ -505,23 +528,31 @@ class ImageryProvider(Provider):
         )
         return coloured
 
-    def _warn_mixed_baselines(
-        self, group: Sequence[Mapping[str, Any]], day: date, progress: ProgressCallback
+    def _reject_mixed_baselines(
+        self,
+        group: Sequence[Mapping[str, Any]],
+        day: date,
+        variables: Sequence[str],
     ) -> None:
         baselines = {
-            str((item.get("properties") or {}).get("s2:processing_baseline"))
+            str((item.get("properties") or {}).get("s2:processing_baseline") or "unknown")
             for item in group
-            if (item.get("properties") or {}).get("s2:processing_baseline") is not None
         }
-        if len(baselines) > 1:
-            # The -0.1 reflectance offset applies only from baseline 04.00, so a
-            # mixed group is radiometrically inconsistent once merged.
-            progress(
-                ProgressEvent(
-                    "warning",
-                    f"{day.isoformat()} merges processing baselines "
-                    f"{', '.join(sorted(baselines))}; reflectance offsets differ",
-                )
+        incompatible = any(
+            len(
+                {
+                    self.band_attrs(variable, item).get("add_offset")
+                    for item in group
+                }
+            )
+            > 1
+            for variable in variables
+        )
+        if incompatible:
+            raise DownloadError(
+                f"{day.isoformat()} has mixed Sentinel-2 processing baselines "
+                f"{', '.join(sorted(baselines))}; they require different reflectance "
+                "offsets and cannot be safely mosaicked"
             )
 
     def slices(
@@ -546,7 +577,7 @@ class ImageryProvider(Provider):
         try:
             for day, group in groups.items():
                 cancel.check()
-                self._warn_mixed_baselines(group, day, progress)
+                self._reject_mixed_baselines(group, day, request.variables)
                 scenes = [str(item.get("id", "scene")) for item in group]
                 for variable in request.variables:
                     cancel.check()

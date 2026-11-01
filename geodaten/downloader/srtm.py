@@ -5,13 +5,10 @@ from __future__ import annotations
 import math
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
-
-import requests
 
 from geodaten.common.errors import ConfigurationError, DownloadError
 from geodaten.common.gdal import mosaic_to_cog, validate_raster
-from geodaten.common.io import cache_root, make_session, stream_download
+from geodaten.common.io import cache_root, make_session, remote_exists, stream_download
 from geodaten.common.models import (
     BBox,
     DatasetSpec,
@@ -56,26 +53,8 @@ def tile_url(label: str) -> str:
     return f"{BASE_URL}/{label}.tif"
 
 
-def _tile_available(session: Any, label: str) -> bool:
-    response: Any = None
-    try:
-        response = session.head(tile_url(label), allow_redirects=True, timeout=(30, 90))
-        if response.status_code in {405, 501}:
-            response.close()
-            response = session.get(
-                tile_url(label),
-                headers={"Range": "bytes=0-0"},
-                stream=True,
-                allow_redirects=True,
-                timeout=(30, 90),
-            )
-        with response:
-            if response.status_code == 404:
-                return False
-            response.raise_for_status()
-            return True
-    except requests.RequestException as exc:
-        raise DownloadError(f"Could not check availability of SRTM tile {label}") from exc
+def _tile_available(session: object, label: str) -> bool:
+    return remote_exists(session, tile_url(label), f"SRTM tile {label}")
 
 
 class SrtmProvider(Provider):

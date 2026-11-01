@@ -13,9 +13,10 @@ import pytest
 import rasterio
 from rasterio.transform import from_bounds, from_origin
 
+import geodaten.downloader.base as base_module
 from geodaten.cli import parse_provider_options
 from geodaten.common.auth import redacted, resolve_credentials
-from geodaten.common.errors import CancelledError, OutputError
+from geodaten.common.errors import CancelledError, DependencyError, OutputError
 from geodaten.common.gdal import run as run_process
 from geodaten.common.gdal import translate_to_cog
 from geodaten.common.models import (
@@ -24,12 +25,13 @@ from geodaten.common.models import (
     DownloadRequest,
     OptionSpec,
     OutputFormat,
+    OUTPUT_SCHEMA_VERSION,
     RasterBlock,
     RasterSlice,
     TimeRange,
 )
 from geodaten.common.progress import CancellationToken
-from geodaten.common.writers import NetCDFWriter, TiffWriter
+from geodaten.common.writers import NetCDFWriter, TiffWriter, output_root
 
 
 def request(tmp_path: Path, output_format: OutputFormat) -> DownloadRequest:
@@ -101,6 +103,15 @@ def test_request_fingerprint_and_public_dict_exclude_credentials(tmp_path: Path)
     assert redacted(first.credentials) == {"secret": "***"}
 
 
+def test_latest_source_revisions_refresh_in_one_output_root(tmp_path: Path) -> None:
+    base = request(tmp_path, OutputFormat.TIF)
+    dynamic = DownloadRequest(
+        **{**base.__dict__, "time": TimeRange("2020-01-01", "latest")}
+    )
+    assert output_root(dynamic, "source:v1") == output_root(dynamic, "source:v2")
+    assert output_root(base, "source:v1") != output_root(base, "source:v2")
+
+
 def test_provider_option_parser() -> None:
     specs = (
         OptionSpec("count", "Count", kind="int", default=2),
@@ -154,6 +165,18 @@ def test_credentials_preserve_user_value_and_ignore_none(monkeypatch) -> None:
     }
 
 
+def test_optional_dependency_check_imports_the_module(monkeypatch) -> None:
+    monkeypatch.setattr(base_module, "import_module", lambda _name: object())
+    assert base_module.require_module("working", "extra") is not None
+
+    def fail(_name: str) -> object:
+        raise ImportError("broken transitive dependency")
+
+    monkeypatch.setattr(base_module, "import_module", fail)
+    with pytest.raises(DependencyError, match=r"geodaten\[extra\]"):
+        base_module.require_module("broken", "extra")
+
+
 def test_tiff_writer_creates_single_band_cog(tmp_path: Path) -> None:
     source = source_raster(tmp_path)
     writer = TiffWriter(request(tmp_path, OutputFormat.TIF))
@@ -171,6 +194,7 @@ def test_tiff_writer_creates_single_band_cog(tmp_path: Path) -> None:
         assert dataset.width == 4
         assert dataset.tags()["VARIABLE"] == "temperature"
         assert dataset.tags()["REQUEST_FINGERPRINT"] == writer.request.fingerprint
+        assert dataset.tags()["OUTPUT_SCHEMA"] == str(OUTPUT_SCHEMA_VERSION)
         assert dataset.tags()["OUTPUT_NAME"] == output.name
         assert dataset.nodata == 0
         assert dataset.scales == (0.1,)
@@ -211,6 +235,9 @@ def test_netcdf_writer_appends_time_slices_blockwise(tmp_path: Path) -> None:
         assert dataset.variables["x"].standard_name == "longitude"
         assert dataset.geospatial_bounds.startswith("POLYGON(")
         assert dataset.geospatial_bounds_crs == "EPSG:4326"
+        assert dataset.geospatial_lat_min == pytest.approx(20.5)
+        assert dataset.geospatial_lat_max == pytest.approx(22.0)
+        assert dataset.output_schema == OUTPUT_SCHEMA_VERSION
 
 
 def test_writers_expand_or_append_a_multitime_raster_block(tmp_path: Path) -> None:

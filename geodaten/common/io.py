@@ -73,6 +73,30 @@ def make_session(retries: int = 5, backoff: float = 1.0) -> requests.Session:
     return session
 
 
+def remote_exists(session: Any, url: str, label: str) -> bool:
+    """Check one public HTTP asset without downloading its body."""
+
+    response: Any = None
+    try:
+        response = session.head(url, allow_redirects=True, timeout=(30, 90))
+        if response.status_code in {405, 501}:
+            response.close()
+            response = session.get(
+                url,
+                headers={"Range": "bytes=0-0"},
+                stream=True,
+                allow_redirects=True,
+                timeout=(30, 90),
+            )
+        with response:
+            if response.status_code == 404:
+                return False
+            response.raise_for_status()
+            return True
+    except requests.RequestException as exc:
+        raise DownloadError(f"Could not check availability of {label}") from exc
+
+
 @contextmanager
 def atomic_path(final: Path, *, suffix: str = ".part") -> Iterator[Path]:
     final = Path(final)

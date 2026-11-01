@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import functools
+import http.server
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -9,7 +12,7 @@ import pytest
 from geodaten.common.errors import AuthenticationError, ConfigurationError
 from geodaten.common.models import BBox, DownloadRequest, OutputFormat, TimeRange
 from geodaten.common.progress import CancellationToken
-from geodaten.downloader.arco import resolve_cds_api_key
+from geodaten.downloader.arco import open_arco_dataset, resolve_cds_api_key
 from geodaten.downloader.era5_land import (
     GROUP_BY_VARIABLE,
     Era5LandProvider,
@@ -129,6 +132,64 @@ def test_auto_chunking_uses_time_layout_for_monthly_retrieval() -> None:
         end="2020-02",
     )
     assert provider._chunking(req) == "time"
+
+
+def test_small_extent_selects_intersecting_era5_cell() -> None:
+    provider = Era5LandProvider()
+    dataset = FakeDataset(("2020-01-02T00",), GROUP_BY_VARIABLE["t2m"].variables)
+    latitudes = dataset["latitude"].values
+    longitudes = dataset["longitude"].values
+    selected = provider._spatial_indices(
+        request(bbox=BBox(0.001, 0.001, 0.01, 0.01)),
+        latitudes,
+        longitudes,
+    )
+    assert selected[2].tolist() == [0.0]
+    assert selected[3].tolist() == [0.0]
+
+
+def test_arco_access_opens_consolidated_zarr3_over_http(tmp_path: Path) -> None:
+    xr = pytest.importorskip("xarray")
+    pytest.importorskip("zarr")
+
+    store = tmp_path / "test.zarr"
+    xr.Dataset(
+        {"t2m": (("time", "latitude", "longitude"), np.ones((1, 1, 1), "float32"))},
+        coords={
+            "time": np.asarray(("2020-01-01T00",), dtype="datetime64[h]"),
+            "latitude": [0.0],
+            "longitude": [0.0],
+        },
+    ).to_zarr(store, mode="w", consolidated=True, zarr_format=3)
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        authorization: str | None = None
+
+        def do_GET(self) -> None:  # noqa: N802 - stdlib callback name
+            type(self).authorization = self.headers.get("Authorization")
+            super().do_GET()
+
+        def log_message(self, _format: str, *args: object) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        functools.partial(Handler, directory=str(tmp_path)),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        dataset = open_arco_dataset(
+            f"http://127.0.0.1:{server.server_port}/test.zarr", "test-token"
+        )
+        assert dataset["t2m"].shape == (1, 1, 1)
+        assert float(dataset["t2m"].values[0, 0, 0]) == 1.0
+        assert Handler.authorization == "Bearer test-token"
+        dataset.close()
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
 
 
 def test_cds_key_uses_only_user_sources(tmp_path: Path) -> None:

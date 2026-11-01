@@ -37,7 +37,6 @@ def _runtime_warnings_from_manifest(path: Path) -> tuple[str, ...]:
 class DownloadService:
     def plan(self, request: DownloadRequest) -> DownloadPlan:
         provider = get_provider(request.dataset)
-        provider.validate(request)
         return provider.plan(request)
 
     def download(
@@ -66,10 +65,14 @@ class DownloadService:
             progress(event)
 
         provider = get_provider(request.dataset)
-        provider.validate(request)
         plan = provider.plan(request)
         report(ProgressEvent("plan", f"Plan ready for {request.dataset}"))
-        writer = make_writer(request, progress=report, cancel=token)
+        writer = make_writer(
+            request,
+            source_identity=plan.source_identity,
+            progress=report,
+            cancel=token,
+        )
 
         staging_root = cache_root(request)
         try:
@@ -94,7 +97,7 @@ class DownloadService:
             writer.abort()
             raise
 
-        root = output_root(request)
+        root = output_root(request, plan.source_identity)
         root.mkdir(parents=True, exist_ok=True)
         reused_complete_request = reused_request or (
             isinstance(writer, NetCDFWriter) and writer.complete

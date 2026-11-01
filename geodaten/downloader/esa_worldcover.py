@@ -6,13 +6,10 @@ import json
 import math
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
-
-import requests
 
 from geodaten.common.errors import ConfigurationError, DownloadError
 from geodaten.common.gdal import warp_to_cog
-from geodaten.common.io import make_session
+from geodaten.common.io import make_session, remote_exists
 from geodaten.common.models import (
     BBox,
     DatasetSpec,
@@ -67,26 +64,8 @@ def remote_tile(label: str) -> str:
     return "/vsicurl?max_retry=5&retry_delay=2&list_dir=no&url=" + tile_url(label)
 
 
-def _tile_available(session: Any, label: str) -> bool:
-    response: Any = None
-    try:
-        response = session.head(tile_url(label), allow_redirects=True, timeout=(30, 90))
-        if response.status_code in {405, 501}:
-            response.close()
-            response = session.get(
-                tile_url(label),
-                headers={"Range": "bytes=0-0"},
-                stream=True,
-                allow_redirects=True,
-                timeout=(30, 90),
-            )
-        with response:
-            if response.status_code == 404:
-                return False
-            response.raise_for_status()
-            return True
-    except requests.RequestException as exc:
-        raise DownloadError(f"Could not check ESA WorldCover tile {label}") from exc
+def _tile_available(session: object, label: str) -> bool:
+    return remote_exists(session, tile_url(label), f"ESA WorldCover tile {label}")
 
 
 class EsaWorldCoverProvider(Provider):

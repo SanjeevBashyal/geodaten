@@ -8,7 +8,7 @@ import json
 import shutil
 import sys
 from dataclasses import asdict
-from importlib.util import find_spec
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -193,15 +193,18 @@ class ConsoleProgress:
         print(f"[{event.stage}] {event.message}{suffix}", flush=True)
 
 
+def _module_available(name: str) -> bool:
+    try:
+        import_module(name)
+        return True
+    except Exception:
+        return False
+
+
 def _doctor() -> int:
-    def module_available(name: str) -> bool:
-        try:
-            return find_spec(name) is not None
-        except (ImportError, ModuleNotFoundError, ValueError):
-            return False
 
     qt_binding = any(
-        module_available(name) for name in ("PySide6", "PyQt6", "PySide2", "PyQt5")
+        _module_available(name) for name in ("PySide6", "PyQt6", "PySide2", "PyQt5")
     )
     checks = {
         "gdalinfo": shutil.which("gdalinfo") is not None,
@@ -210,15 +213,18 @@ def _doctor() -> int:
         "gdalwarp": shutil.which("gdalwarp") is not None,
         "ogrinfo": shutil.which("ogrinfo") is not None,
         "ogr2ogr": shutil.which("ogr2ogr") is not None,
-        "requests": module_available("requests"),
-        "rasterio": module_available("rasterio"),
-        "pyproj": module_available("pyproj"),
-        "netCDF4": module_available("netCDF4"),
-        "remotezip [zenodo]": module_available("remotezip"),
-        "earthaccess [earthdata]": module_available("earthaccess"),
-        "boto3 [cdse]": module_available("boto3"),
-        "textual [tui]": module_available("textual"),
-        "qtpy + Qt binding [gui]": module_available("qtpy") and qt_binding,
+        "requests": _module_available("requests"),
+        "rasterio": _module_available("rasterio"),
+        "pyproj": _module_available("pyproj"),
+        "netCDF4": _module_available("netCDF4"),
+        "remotezip [zenodo]": _module_available("remotezip"),
+        "earthaccess [earthdata]": _module_available("earthaccess"),
+        "boto3 [cdse]": _module_available("boto3"),
+        "xarray + zarr + fsspec [arco]": all(
+            _module_available(name) for name in ("xarray", "zarr", "fsspec")
+        ),
+        "textual [tui]": _module_available("textual"),
+        "qtpy + Qt binding [gui]": _module_available("qtpy") and qt_binding,
     }
     for name, available in checks.items():
         print(f"{'ok' if available else 'missing':7} {name}")

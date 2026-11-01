@@ -26,6 +26,8 @@ Credentials are always supplied by the user through environment variables, an SD
 | `modis_lai` | MODIS LAI/FPAR C6.1 | `tif`, `netcdf` | NASA Earthdata account |
 | `copernicus_lai` | Copernicus Global Land LAI 300 m v2 | `tif`, `netcdf` | Copernicus Data Space account |
 | `era5_land` | ECMWF ERA5-Land hourly ARCO | `tif`, `netcdf` | CDS account and accepted licence |
+| `chirps` | CHIRPS v3 daily precipitation | `tif`, `netcdf` | Public Zarr mirror |
+| `chirts_era5` | CHIRTS-ERA5 daily temperature | `tif`, `netcdf` | Public Zarr mirror |
 | `nex_gddp_cmip6` | NASA NEX-GDDP-CMIP6 | `tif`, `netcdf` | Public cloud archive |
 | `sentinel2` | Sentinel-2 MSI Level-2A scenes | `tif` | Public Planetary Computer STAC |
 | `landsat9` | Landsat 9 Collection 2 Level-2 scenes | `tif` | Public Planetary Computer STAC |
@@ -46,7 +48,7 @@ Install only the adapters and interfaces you use:
 python -m pip install -e ".[zenodo]"       # GLC_FCS30D and GIMMS
 python -m pip install -e ".[earthdata]"    # MODIS
 python -m pip install -e ".[cdse]"         # Copernicus LAI
-python -m pip install -e ".[arco]"         # ERA5-Land ARCO/Zarr
+python -m pip install -e ".[arco]"         # ERA5-Land, CHIRPS, and CHIRTS Zarr
 python -m pip install -e ".[tui]"
 python -m pip install -e ".[gui-pyside6]"
 ```
@@ -96,7 +98,11 @@ geodaten download modis_lai \
 
 ERA5-Land reads the caller's own CDS token from `CDSAPI_KEY`, `~/.cdsapirc`, a masked prompt, or `credentials={"cds_api_key": "..."}` in Python. Accept the ERA5-Land licence in the CDS before access. Its `hours` option selects UTC hours and `chunking=auto|geo|time` controls the ARCO layout; `auto` uses the time-chunked stores because retrieval is performed month by month. The ARCO precipitation and radiation values are already hourly de-accumulated and are written without another conversion.
 
+CHIRPS and CHIRTS-ERA5 require no account or API key. Planning resolves each public Zarr mirror's current immutable commit, which is reused for the matching download and recorded in the manifest. CHIRPS exposes `pr`; CHIRTS-ERA5 exposes `tasmax` and `tasmin`.
+
 `sentinel2` and `landsat9` write **one GeoTIFF per variable per acquisition date**: every scene covering the extent on that date is reprojected and mosaicked into a single raster, so an extent spanning several MGRS tiles or WRS rows still yields one file rather than fragments. Grouping is by date because Landsat numbers adjacent rows of one pass seconds apart. Both offer an `rgb` variable that stacks red/green/blue into one three-band image with the matching colour interpretation, for loading straight into GIS; values stay native reflectance with the documented scale and offset, so the viewer applies its own stretch. `sentinel2` filters at 20% cloud by default while `landsat9` keeps every scene, since its 16-day revisit makes a discarded acquisition expensive; set `-O max_cloud_cover=` on either to change that.
+
+Sentinel-2 scenes from processing baselines that require different reflectance offsets are not merged into one raster; the request stops with the affected date and baseline identifiers instead of producing radiometrically inconsistent values.
 
 Use `--allow-partial` only when an incomplete source coverage is acceptable. Existing validated outputs are reused unless `--overwrite` is set. A temporal request containing literal `latest` deliberately refreshes discovery and outputs; use explicit dates for reproducible resume. `--workers` is a provider concurrency hint, currently used mainly to size connection pools; a provider may still run safely in sequence.
 
@@ -138,9 +144,9 @@ The GUI remembers its inputs. Starting a plan or download and closing the window
 
 ## Output layout and large requests
 
-Each request is stored below `OUTPUT/DATASET/FINGERPRINT/` with a credential-free `manifest.json`. The fingerprint makes retries deterministic while excluding credentials, worker hints, cache locations, and output paths. Files are first written to a temporary path and atomically moved into place only after validation.
+Each request is stored below `OUTPUT/DATASET/FINGERPRINT/` with a credential-free `manifest.json`. For explicit reproducible requests, the folder fingerprint combines the request with an immutable source identity when the provider can supply one, so changing source revisions or scene inventories cannot be mixed or mislabeled during resume. A literal `latest` keeps one refreshable root instead of accumulating a new large directory for every source update. Credentials, worker hints, cache locations, and output paths remain excluded. Files are first written to a temporary path and atomically moved into place only after validation.
 
-Raster transfers and conversions use streaming I/O and GDAL virtual rasters. NetCDF data are compressed and appended in bounded raster windows, so memory use is based on a processing block rather than the complete spatial/temporal cube. ERA5-Land fetches one variable and spatial subset for a calendar month in each Zarr selection and stages it as a multiband raster. The NetCDF writer appends that whole time block in one pass, while TIFF output expands its bands into the required hourly COGs; exceptionally large extents are split below a 512 MiB decoded-data ceiling. `--cache` selects a staging location; SRTM, HydroSHEDS, and MODIS reuse validated source tiles or assets, while request scratch data and incomplete NetCDF files are deliberately removed. A retry reuses an exact, validated complete TIFF set without restaging provider data. Without `--overwrite`, a partial TIFF retry may repeat provider staging but never overwrites already validated completed slices. Source services may still impose request-size, rate, date-range, account, or beta-service limits, so use `plan` before large jobs.
+Raster transfers and conversions use streaming I/O and GDAL virtual rasters. NetCDF data are compressed and appended in bounded raster windows, so memory use is based on a processing block rather than the complete spatial/temporal cube. ERA5-Land, CHIRPS, and CHIRTS-ERA5 fetch one variable and spatial subset per calendar-month block. The NetCDF writer appends that whole block in one pass, while TIFF output expands its bands into the required time slices; exceptionally large extents are split below a 512 MiB decoded-data ceiling. `--cache` selects a staging location; SRTM, HydroSHEDS, and MODIS reuse validated source tiles or assets, while request scratch data and incomplete NetCDF files are deliberately removed. A retry reuses an exact, validated complete TIFF set without restaging provider data. Without `--overwrite`, a partial TIFF retry may repeat provider staging but never overwrites already validated completed slices. Source services may still impose request-size, rate, date-range, account, or beta-service limits, so use `plan` before large jobs.
 
 A `shp` request writes the whole `.shp`/`.shx`/`.dbf`/`.prj`/`.cpg` set for each layer, all of which are listed in the manifest; the set is built beside the target and moved in together, and a retry reuses a validated complete set without restaging. Vector sources that ship as one large archive are cropped locally, so the source is cached below `--cache` and reused by later extents; `geodaten info glim` documents the options that relocate, reuse, or discard it.
 

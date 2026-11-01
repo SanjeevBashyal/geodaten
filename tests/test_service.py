@@ -36,6 +36,7 @@ class FakeProvider(Provider):
 
     def __init__(self) -> None:
         self.slice_calls = 0
+        self.source_identity = "fake:v1"
 
     def plan(self, request: DownloadRequest) -> DownloadPlan:
         return DownloadPlan(
@@ -46,6 +47,7 @@ class FakeProvider(Provider):
                 "download_url": "https://user:password@example.test/data?token=value",
                 "api_token": "must-not-be-written",
             },
+            source_identity=self.source_identity,
         )
 
     def slices(self, request, workspace, progress, cancel):
@@ -106,6 +108,10 @@ def test_service_writes_one_netcdf_for_entire_request(tmp_path, monkeypatch) -> 
 
     assert len(result.outputs) == 1
     assert result.outputs[0].suffix == ".nc"
+    import netCDF4
+
+    with netCDF4.Dataset(result.outputs[0]) as dataset:
+        assert dataset.source_identity == "fake:v1"
 
 
 def test_service_resumes_complete_tiff_request_without_provider_slices(
@@ -128,6 +134,26 @@ def test_service_resumes_complete_tiff_request_without_provider_slices(
     assert not retry_cache.exists()
 
 
+def test_service_separates_outputs_when_the_source_identity_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    provider = FakeProvider()
+    monkeypatch.setattr(service_module, "get_provider", lambda _identifier: provider)
+    item = make_request(tmp_path, OutputFormat.TIF)
+    first = DownloadService().download(item)
+
+    provider.source_identity = "fake:v2"
+    second = DownloadService().download(item)
+
+    assert provider.slice_calls == 2
+    assert first.outputs[0].parent != second.outputs[0].parent
+    assert first.outputs[0].is_file() and second.outputs[0].is_file()
+    manifest = json.loads(second.manifest.read_text())
+    assert manifest["plan"]["source_identity"] == "fake:v2"
+    with rasterio.open(second.outputs[0]) as dataset:
+        assert dataset.tags()["SOURCE_IDENTITY"] == "fake:v2"
+
+
 def test_service_keeps_explicit_netcdf_existing_output_shortcut(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -143,6 +169,26 @@ def test_service_keeps_explicit_netcdf_existing_output_shortcut(
     assert provider.slice_calls == 1
     assert resumed.skipped == 1
     assert not retry_cache.exists()
+
+
+def test_service_rebuilds_netcdf_with_mismatched_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import netCDF4
+
+    provider = FakeProvider()
+    monkeypatch.setattr(service_module, "get_provider", lambda _identifier: provider)
+    item = make_request(tmp_path, OutputFormat.NETCDF)
+    first = DownloadService().download(item)
+    with netCDF4.Dataset(first.outputs[0], "r+") as dataset:
+        dataset.request_fingerprint = "unrelated"
+
+    rebuilt = DownloadService().download(item)
+
+    assert provider.slice_calls == 2
+    assert rebuilt.skipped == 0
+    with netCDF4.Dataset(rebuilt.outputs[0]) as dataset:
+        assert dataset.request_fingerprint == item.fingerprint
 
 
 @pytest.mark.parametrize("output_format", (OutputFormat.TIF, OutputFormat.NETCDF))
@@ -197,6 +243,10 @@ def test_service_does_not_fast_resume_unsafe_tiff_sets(
     DownloadService().download(item)
 
     assert provider.slice_calls == 2
+    if damage == "arbitrary":
+        with rasterio.open(first.outputs[0]) as dataset:
+            assert dataset.tags()["REQUEST_FINGERPRINT"] == item.fingerprint
+            assert not np.all(dataset.read(1) == 1)
 
 
 def test_service_records_unique_sanitized_runtime_warnings(

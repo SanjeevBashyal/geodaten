@@ -24,6 +24,7 @@ class OutputFormat(str, Enum):
 
 RASTER_FORMATS: tuple[OutputFormat, ...] = (OutputFormat.TIF, OutputFormat.NETCDF)
 VECTOR_FORMATS: tuple[OutputFormat, ...] = (OutputFormat.SHP,)
+OUTPUT_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -228,6 +229,7 @@ class DownloadRequest:
         payload.pop("cache_dir", None)
         payload.pop("overwrite", None)
         payload.pop("workers", None)
+        payload["output_schema"] = OUTPUT_SCHEMA_VERSION
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(raw).hexdigest()[:16]
 
@@ -240,6 +242,7 @@ class DownloadPlan:
     estimated_bytes: int | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    source_identity: str = ""
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -249,6 +252,7 @@ class DownloadPlan:
             "estimated_bytes": self.estimated_bytes,
             "details": _json_value(self.details),
             "warnings": list(self.warnings),
+            "source_identity": self.source_identity,
         }
 
 

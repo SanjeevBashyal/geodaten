@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from importlib.util import find_spec
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -99,12 +99,10 @@ class Provider(ABC):
         }
 
 
-def require_module(module: str, extra: str) -> None:
+def require_module(module: str, extra: str) -> Any:
     try:
-        available = find_spec(module) is not None
-    except (ImportError, ModuleNotFoundError, ValueError):
-        available = False
-    if not available:
+        return import_module(module)
+    except Exception as exc:
         raise DependencyError(
             f"Optional dependency {module!r} is required; install geodaten[{extra}]"
-        )
+        ) from exc

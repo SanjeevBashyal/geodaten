@@ -369,6 +369,16 @@ def test_plan_counts_every_scene_and_variable_combination(monkeypatch) -> None:
     assert plan.details["assets"] == ("B04", "B08")
     assert plan.details["first_acquisition"] == "2025-06-21T10:06:11"
     assert plan.estimated_bytes is None
+    assert plan.source_identity.startswith("stac:")
+
+
+def test_stac_source_identity_changes_with_the_asset_inventory(monkeypatch) -> None:
+    provider = Sentinel2Provider()
+    first = item("a")
+    monkeypatch.setattr(provider, "_items_for", lambda _request: (first,))
+    initial = provider.plan(request()).source_identity
+    first["assets"]["B04"]["href"] += "?revision=2"
+    assert provider.plan(request()).source_identity != initial
 
 
 def test_landsat_keeps_every_scene_whatever_the_cloud_cover(monkeypatch) -> None:
@@ -606,23 +616,39 @@ def test_a_group_spanning_storage_containers_is_refused(
         )
 
 
-def test_mixed_processing_baselines_warn_before_merging(
+def test_mixed_processing_baselines_are_rejected_before_merging(
     monkeypatch, tmp_path: Path
 ) -> None:
     provider = Sentinel2Provider()
     scenes = (item("a", baseline="05.11"), item("b", tile="32UQB", baseline="03.01"))
     _stub_slices(monkeypatch, provider, scenes, tmp_path)
-    events: list[ProgressEvent] = []
-    produced = list(
-        provider.slices(
-            request(variables=("b04",)), tmp_path, events.append, CancellationToken()
+    with pytest.raises(DownloadError, match="mixed Sentinel-2 processing baselines"):
+        list(
+            provider.slices(
+                request(variables=("b04",)),
+                tmp_path,
+                lambda _event: None,
+                CancellationToken(),
+            )
         )
-    )
-    assert len(produced) == 1
-    assert any(
-        event.stage == "warning" and "03.01" in event.message and "05.11" in event.message
-        for event in events
-    )
+
+
+def test_mixed_processing_baselines_allow_unscaled_classification(
+    monkeypatch, tmp_path: Path
+) -> None:
+    provider = Sentinel2Provider()
+    scenes = (item("a", baseline="05.11"), item("b", tile="32UQB", baseline="03.01"))
+    _stub_slices(monkeypatch, provider, scenes, tmp_path)
+    assert len(
+        list(
+            provider.slices(
+                request(variables=("scl",)),
+                tmp_path,
+                lambda _event: None,
+                CancellationToken(),
+            )
+        )
+    ) == 1
 
 
 def test_a_missing_asset_stops_the_run_unless_partial_is_allowed(

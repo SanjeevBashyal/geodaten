@@ -27,6 +27,7 @@ from geodaten.common.models import (
     VariableSpec,
 )
 from geodaten.common.progress import CancellationToken, ProgressCallback, ProgressEvent
+from geodaten.common.spatial import intersecting_cell_indices
 from geodaten.downloader.arco import open_arco_dataset, resolve_cds_api_key
 from geodaten.downloader.base import Provider
 
@@ -277,19 +278,24 @@ class Era5LandProvider(Provider):
     ) -> tuple[np.ndarray, tuple[np.ndarray, ...], np.ndarray, np.ndarray]:
         lat_order = np.argsort(latitudes)
         sorted_latitudes = latitudes[lat_order]
-        latitude_indices = lat_order[
-            (sorted_latitudes >= request.bbox.south) & (sorted_latitudes <= request.bbox.north)
-        ]
+        latitude_indices = intersecting_cell_indices(
+            latitudes,
+            request.bbox.south,
+            request.bbox.north,
+            _regular(sorted_latitudes, "latitude"),
+        )
         if latitude_indices.size == 0:
             raise ConfigurationError("The ERA5-Land extent contains no 0.1 degree latitude cells")
 
         longitude_parts: list[np.ndarray] = []
         output_longitudes: list[np.ndarray] = []
         for part, segment in enumerate(request.bbox.segments()):
-            indices = np.flatnonzero(
-                (longitudes >= segment.west) & (longitudes <= segment.east)
+            indices = intersecting_cell_indices(
+                longitudes,
+                segment.west,
+                segment.east,
+                _regular(np.sort(longitudes), "longitude"),
             )
-            indices = indices[np.argsort(longitudes[indices])]
             if indices.size == 0:
                 raise ConfigurationError("The ERA5-Land extent contains no 0.1 degree longitude cells")
             values = longitudes[indices].astype("float64", copy=True)
