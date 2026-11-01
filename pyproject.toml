@@ -31,11 +31,6 @@ dependencies = [
 zenodo = ["remotezip>=0.12"]
 earthdata = ["earthaccess>=0.18"]
 cdse = ["boto3>=1.34"]
-destine = [
-    "earthkit-data[polytope]>=1.1",
-    "earthkit-regrid>=0.4",
-    "scipy>=1.11",
-]
 arco = [
     "fsspec>=2024.2",
     "xarray>=2024.2",
@@ -47,12 +42,9 @@ gui-pyside6 = ["qtpy>=2.4", "PySide6>=6.7"]
 all = [
     "boto3>=1.34",
     "earthaccess>=0.18",
-    "earthkit-data[polytope]>=1.1",
-    "earthkit-regrid>=0.4",
     "fsspec>=2024.2",
     "qtpy>=2.4",
     "remotezip>=0.12",
-    "scipy>=1.11",
     "textual>=1,<9",
     "xarray>=2024.2",
     "zarr>=2.17,<3",

@@ -1,20 +1,33 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
 import sys
 from types import ModuleType
+import zipfile
 
 import pytest
 import requests
 
-from geodaten.common.errors import AuthenticationError, ConfigurationError, DownloadError
+from geodaten.common.errors import ConfigurationError, DownloadError
 from geodaten.common.models import BBox, DownloadRequest, OutputFormat, TimeRange
 from geodaten.common.progress import CancellationToken
 import geodaten.downloader.gimms_lai4g as gimms_module
 import geodaten.downloader.glc_fcs30d as glc_module
+import geodaten.downloader.esa_worldcover as worldcover_module
 import geodaten.downloader.srtm as srtm_module
+from geodaten.downloader.esa_worldcover import (
+    EsaWorldCoverProvider,
+    intersecting_tiles as worldcover_tiles,
+    remote_tile as worldcover_remote,
+    tile_url as worldcover_url,
+)
+from geodaten.downloader.hydrosheds import (
+    HydroShedsProvider,
+    _extract_tile,
+    catalog_urls,
+    intersecting_tiles as hydrosheds_tiles,
+)
 from geodaten.downloader.gimms_lai4g import (
     GimmsLai4gProvider,
     HalfMonth,
@@ -52,6 +65,7 @@ def request(
     time: TimeRange | None = None,
     options: dict[str, object] | None = None,
     credentials: dict[str, str] | None = None,
+    cache_dir: Path | None = None,
     allow_partial: bool = False,
 ) -> DownloadRequest:
     return DownloadRequest(
@@ -63,6 +77,7 @@ def request(
         output_dir=Path("outputs"),
         options=options or {},
         credentials=credentials or {},
+        cache_dir=cache_dir,
         allow_partial=allow_partial,
     )
 
@@ -127,44 +142,8 @@ def test_srtm_plan_and_url_are_computed_without_network() -> None:
     plan = SrtmProvider().plan(item)
     assert plan.details["tiles"] == ("N50E007", "N50E008")
     assert plan.details["tile_count"] == 2
-    assert tile_url("N50E007").endswith(
-        "/N50E007.SRTMGL1.hgt/N50E007.SRTMGL1.hgt.zip"
-    )
-
-
-def test_srtm_spec_exposes_only_user_owned_auth_inputs() -> None:
-    fields = {field.id: field for field in SrtmProvider.spec.credentials}
-    assert set(fields) == {
-        "earthdata_username",
-        "earthdata_password",
-        "earthdata_token",
-    }
-    assert fields["earthdata_password"].secret and fields["earthdata_token"].secret
-    assert fields["earthdata_username"].environment == ("EARTHDATA_USERNAME",)
-    assert all(field.required is False for field in fields.values())
-
-
-def test_srtm_token_takes_precedence_over_incomplete_pair(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    for name in ("EARTHDATA_TOKEN", "EARTHDATA_USERNAME", "EARTHDATA_PASSWORD"):
-        monkeypatch.delenv(name, raising=False)
-    provider = SrtmProvider()
-    provider.validate(
-        request(
-            "srtm",
-            ("elevation",),
-            credentials={"earthdata_token": "user-token", "earthdata_username": "user"},
-        )
-    )
-    with pytest.raises(AuthenticationError, match="supplied together"):
-        provider.validate(
-            request(
-                "srtm",
-                ("elevation",),
-                credentials={"earthdata_username": "user"},
-            )
-        )
+    assert tile_url("N50E007").endswith("/SRTM_GL1_srtm/N50E007.tif")
+    assert SrtmProvider.spec.credentials == ()
 
 
 @pytest.mark.parametrize(
@@ -172,11 +151,11 @@ def test_srtm_token_takes_precedence_over_incomplete_pair(
     (
         (200, True, None),
         (404, False, None),
-        (401, None, AuthenticationError),
+        (401, None, DownloadError),
         (503, None, DownloadError),
     ),
 )
-def test_srtm_preflight_distinguishes_ocean_auth_and_server_failures(
+def test_srtm_preflight_distinguishes_ocean_and_server_failures(
     status: int,
     expected: bool | None,
     error: type[Exception] | None,
@@ -220,7 +199,7 @@ def test_srtm_preflight_surfaces_transport_failures() -> None:
         srtm_module._tile_available(Session(), "N00E000")
 
 
-def test_srtm_slices_skip_only_confirmed_404_tiles(
+def test_srtm_slices_cache_tiles_and_skip_only_confirmed_404(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     downloaded: list[str] = []
@@ -228,19 +207,10 @@ def test_srtm_slices_skip_only_confirmed_404_tiles(
     mosaic_options: dict[str, object] = {}
     events: list[str] = []
 
-    @contextmanager
-    def session(_request: DownloadRequest):
-        yield object()
-
     def download(url: str, destination: Path, **_kwargs: object) -> Path:
         downloaded.append(url)
-        destination.write_bytes(b"zip")
-        return destination
-
-    def extract(
-        _archive: Path, destination: Path, **_kwargs: object
-    ) -> Path:
-        destination.write_bytes(b"hgt")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"tif")
         return destination
 
     def mosaic(
@@ -253,17 +223,31 @@ def test_srtm_slices_skip_only_confirmed_404_tiles(
         destination.write_bytes(b"raster")
         return destination
 
-    monkeypatch.setattr(srtm_module, "_earthdata_session", session)
+    class Session:
+        @staticmethod
+        def close() -> None:
+            pass
+
+    monkeypatch.setattr(srtm_module, "make_session", Session)
     monkeypatch.setattr(
         srtm_module,
         "_tile_available",
         lambda _session, label: label == "N26E080",
     )
     monkeypatch.setattr(srtm_module, "stream_download", download)
-    monkeypatch.setattr(srtm_module, "_extract_hgt", extract)
+    monkeypatch.setattr(
+        srtm_module,
+        "validate_raster",
+        lambda path, **_kwargs: path.is_file(),
+    )
     monkeypatch.setattr(srtm_module, "mosaic_to_cog", mosaic)
 
-    item = request("srtm", ("elevation",), bbox=BBox(79, 26, 81, 27))
+    item = request(
+        "srtm",
+        ("elevation",),
+        bbox=BBox(79, 26, 81, 27),
+        cache_dir=tmp_path / "cache",
+    )
     iterator = SrtmProvider().slices(
         item,
         tmp_path,
@@ -274,10 +258,131 @@ def test_srtm_slices_skip_only_confirmed_404_tiles(
     iterator.close()
 
     assert len(downloaded) == 1 and "N26E080" in downloaded[0]
-    assert [source.name for source in mosaicked] == ["N26E080.hgt"]
+    assert [source.name for source in mosaicked] == ["N26E080.tif"]
     assert mosaic_options["nodata"] == -32768
     assert isinstance(mosaic_options["cancel"], CancellationToken)
     assert any("N26E079" in message and "no land" in message for message in events)
+
+
+def test_hydrosheds_tile_math_and_catalog_validation() -> None:
+    assert hydrosheds_tiles(BBox(79, 26, 89, 31)) == (
+        "n20e070",
+        "n20e080",
+        "n30e070",
+        "n30e080",
+    )
+    payload = [
+        {
+            "a_attr": {
+                "href": (
+                    "https://data.hydrosheds.org/file/hydrosheds-v1-dem/"
+                    "as_dem_3s/n20e080_dem.zip"
+                )
+            }
+        },
+        {"a_attr": {"href": "https://example.test/n20e070_dem.zip"}},
+    ]
+    assert catalog_urls(payload, "dem") == {
+        "n20e080": payload[0]["a_attr"]["href"]
+    }
+
+
+def test_hydrosheds_plan_lists_only_published_tiles(monkeypatch) -> None:
+    provider = HydroShedsProvider()
+    monkeypatch.setattr(
+        provider,
+        "_catalog",
+        lambda _code, _session: {
+            "n20e070": "https://data.hydrosheds.org/file/a.zip",
+            "n20e080": "https://data.hydrosheds.org/file/b.zip",
+        },
+    )
+
+    class Session:
+        @staticmethod
+        def close() -> None:
+            pass
+
+    monkeypatch.setattr("geodaten.downloader.hydrosheds.make_session", Session)
+    item = request(
+        "hydrosheds",
+        ("void_filled_dem", "flow_direction"),
+        bbox=BBox(79, 26, 89, 29),
+    )
+    plan = provider.plan(item)
+
+    assert plan.slice_count == 2
+    assert plan.details["tiles"] == {
+        "void_filled_dem": ["n20e070", "n20e080"],
+        "flow_direction": ["n20e070", "n20e080"],
+    }
+    assert HydroShedsProvider.spec.credentials == ()
+
+
+def test_hydrosheds_extracts_only_the_expected_tile(tmp_path: Path) -> None:
+    archive = tmp_path / "tile.zip"
+    with zipfile.ZipFile(archive, "w") as target:
+        target.writestr("nested/n20e080_dem.tif", b"raster")
+        target.writestr("readme.txt", b"metadata")
+    destination = tmp_path / "n20e080_dem.tif"
+
+    assert _extract_tile(
+        archive,
+        destination,
+        label="n20e080",
+        code="dem",
+        cancel=CancellationToken(),
+    ) == destination
+    assert destination.read_bytes() == b"raster"
+
+
+def test_worldcover_tile_math_and_public_urls() -> None:
+    assert worldcover_tiles(BBox(78, 24, 81, 27)) == ("N24E078",)
+    assert worldcover_tiles(BBox(-1, -1, 1, 1)) == (
+        "S03W003",
+        "S03E000",
+        "N00W003",
+        "N00E000",
+    )
+    assert worldcover_url("N24E078").endswith(
+        "/ESA_WorldCover_10m_2021_v200_N24E078_Map.tif"
+    )
+    assert worldcover_remote("N24E078").startswith("/vsicurl?")
+
+
+def test_worldcover_plan_and_streamed_slice(monkeypatch, tmp_path: Path) -> None:
+    provider = EsaWorldCoverProvider()
+    item = request(
+        "esa_worldcover",
+        ("land_cover",),
+        bbox=BBox(79, 26, 82, 27),
+    )
+    assert provider.plan(item).details["tiles"] == ("N24E078", "N24E081")
+
+    class Session:
+        @staticmethod
+        def close() -> None:
+            pass
+
+    staged: list[str] = []
+
+    def warp(sources, destination: Path, **_kwargs: object) -> Path:
+        staged.extend(sources)
+        destination.write_bytes(b"raster")
+        return destination
+
+    monkeypatch.setattr(worldcover_module, "make_session", Session)
+    monkeypatch.setattr(
+        worldcover_module,
+        "_tile_available",
+        lambda _session, label: label == "N24E081",
+    )
+    monkeypatch.setattr(worldcover_module, "warp_to_cog", warp)
+
+    iterator = provider.slices(item, tmp_path, lambda _event: None, CancellationToken())
+    assert next(iterator).variable == "land_cover"
+    iterator.close()
+    assert len(staged) == 1 and "N24E081" in staged[0]
 
 
 def test_glc_selects_only_observation_epochs() -> None:

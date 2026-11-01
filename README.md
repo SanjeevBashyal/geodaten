@@ -17,15 +17,16 @@ Credentials are always supplied by the user through environment variables, an SD
 | ID | Dataset family | Formats | Access |
 | --- | --- | --- | --- |
 | `soilgrids` | ISRIC SoilGrids | `tif`, `netcdf` | Public |
-| `srtm` | NASA SRTMGL1 v3 | `tif`, `netcdf` | NASA Earthdata account |
+| `srtm` | NASA SRTMGL1 v3 via OpenTopography | `tif`, `netcdf` | Public object storage |
+| `hydrosheds` | HydroSHEDS v1.1 core terrain | `tif`, `netcdf` | Public download |
+| `esa_worldcover` | ESA WorldCover 2021 v200 | `tif`, `netcdf` | Public COG tiles |
 | `glc_fcs30d` | GLC_FCS30D v2 land cover | `tif`, `netcdf` | Public Zenodo archive |
 | `glim` | GLiM v1.1 global lithological map | `shp` | Public download |
 | `gimms_lai4g` | GIMMS LAI4g v1.2 | `tif`, `netcdf` | Public Zenodo archive |
 | `modis_lai` | MODIS LAI/FPAR C6.1 | `tif`, `netcdf` | NASA Earthdata account |
 | `copernicus_lai` | Copernicus Global Land LAI 300 m v2 | `tif`, `netcdf` | Copernicus Data Space account |
-| `nex_gddp_cmip6` | NASA NEX-GDDP-CMIP6 | `tif`, `netcdf` | Public cloud archive |
-| `ifs_fesom` | DestinE IFS-FESOM climate simulations | `tif`, `netcdf` | DestinE account |
 | `era5_land` | ECMWF ERA5-Land hourly ARCO | `tif`, `netcdf` | CDS account and accepted licence |
+| `nex_gddp_cmip6` | NASA NEX-GDDP-CMIP6 | `tif`, `netcdf` | Public cloud archive |
 | `sentinel2` | Sentinel-2 MSI Level-2A scenes | `tif` | Public Planetary Computer STAC |
 | `landsat9` | Landsat 9 Collection 2 Level-2 scenes | `tif` | Public Planetary Computer STAC |
 
@@ -43,9 +44,8 @@ Install only the adapters and interfaces you use:
 
 ```bash
 python -m pip install -e ".[zenodo]"       # GLC_FCS30D and GIMMS
-python -m pip install -e ".[earthdata]"    # SRTM and MODIS
+python -m pip install -e ".[earthdata]"    # MODIS
 python -m pip install -e ".[cdse]"         # Copernicus LAI
-python -m pip install -e ".[destine]"      # IFS-FESOM
 python -m pip install -e ".[arco]"         # ERA5-Land ARCO/Zarr
 python -m pip install -e ".[tui]"
 python -m pip install -e ".[gui-pyside6]"
@@ -61,6 +61,7 @@ Discover a dataset before starting a large request:
 geodaten datasets
 geodaten info srtm
 geodaten plan srtm --bbox 5 47 15 55 -v elevation --format tif
+geodaten plan hydrosheds --bbox 5 47 15 55 -v flow_direction --format tif
 ```
 
 Then run the same request as a download:
@@ -129,7 +130,7 @@ geodaten-tui
 geodaten-gui
 ```
 
-Both interfaces collect the dataset, variables, WGS84 extent, dates, output format/directory, a provider worker hint, provider options, and user credentials. The hint does not guarantee parallel execution. The GUI controller uses QtPy and loads the packaged Qt Designer file at `geodaten/gui/download.ui`; the `gui-pyside6` extra supplies the default Qt binding.
+Both interfaces collect the dataset, variables, WGS84 extent, dates, output format/directory, provider options, and user credentials. The CLI and TUI also expose the provider worker hint; the GUI uses the safe package default. The GUI controller uses QtPy and loads the packaged Qt Designer file at `geodaten/gui/download.ui`; the `gui-pyside6` extra supplies the default Qt binding.
 
 The GUI remembers its inputs. Starting a plan or download and closing the window both write `geodaten.json` to `$XDG_CONFIG_HOME/geodaten/` (`~/.config/geodaten/` by default, or wherever `GEODATEN_STATE` points), and the next launch restores the group, dataset, variables, extent, dates, format, output directory, and provider options. Variables, options, and credentials are kept per dataset, so switching datasets and coming back preserves each one's selections.
 
@@ -139,7 +140,7 @@ The GUI remembers its inputs. Starting a plan or download and closing the window
 
 Each request is stored below `OUTPUT/DATASET/FINGERPRINT/` with a credential-free `manifest.json`. The fingerprint makes retries deterministic while excluding credentials, worker hints, cache locations, and output paths. Files are first written to a temporary path and atomically moved into place only after validation.
 
-Raster transfers and conversions use streaming I/O and GDAL virtual rasters. NetCDF data are compressed and appended in bounded raster windows, so memory use is based on a processing block rather than the complete spatial/temporal cube. ERA5-Land fetches one variable and spatial subset for a calendar month in each Zarr selection and stages it as a multiband raster. The NetCDF writer appends that whole time block in one pass, while TIFF output expands its bands into the required hourly COGs; exceptionally large extents are split below a 512 MiB decoded-data ceiling. `--cache` selects a staging location; adapters such as MODIS reuse validated source assets, while request scratch data and incomplete NetCDF files are deliberately removed. A retry reuses an exact, validated complete TIFF set without restaging provider data. Without `--overwrite`, a partial TIFF retry may repeat provider staging but never overwrites already validated completed slices. Source services may still impose request-size, rate, date-range, account, or beta-service limits, so use `plan` before large jobs.
+Raster transfers and conversions use streaming I/O and GDAL virtual rasters. NetCDF data are compressed and appended in bounded raster windows, so memory use is based on a processing block rather than the complete spatial/temporal cube. ERA5-Land fetches one variable and spatial subset for a calendar month in each Zarr selection and stages it as a multiband raster. The NetCDF writer appends that whole time block in one pass, while TIFF output expands its bands into the required hourly COGs; exceptionally large extents are split below a 512 MiB decoded-data ceiling. `--cache` selects a staging location; SRTM, HydroSHEDS, and MODIS reuse validated source tiles or assets, while request scratch data and incomplete NetCDF files are deliberately removed. A retry reuses an exact, validated complete TIFF set without restaging provider data. Without `--overwrite`, a partial TIFF retry may repeat provider staging but never overwrites already validated completed slices. Source services may still impose request-size, rate, date-range, account, or beta-service limits, so use `plan` before large jobs.
 
 A `shp` request writes the whole `.shp`/`.shx`/`.dbf`/`.prj`/`.cpg` set for each layer, all of which are listed in the manifest; the set is built beside the target and moved in together, and a retry reuses a validated complete set without restaging. Vector sources that ship as one large archive are cropped locally, so the source is cached below `--cache` and reused by later extents; `geodaten info glim` documents the options that relocate, reuse, or discard it.
 

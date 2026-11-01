@@ -217,10 +217,6 @@ def _doctor() -> int:
         "remotezip [zenodo]": module_available("remotezip"),
         "earthaccess [earthdata]": module_available("earthaccess"),
         "boto3 [cdse]": module_available("boto3"),
-        "earthkit + Polytope [destine]": all(
-            module_available(name)
-            for name in ("earthkit.data", "earthkit.regrid", "polytope")
-        ),
         "textual [tui]": module_available("textual"),
         "qtpy + Qt binding [gui]": module_available("qtpy") and qt_binding,
     }

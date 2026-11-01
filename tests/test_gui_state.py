@@ -116,7 +116,6 @@ def test_per_dataset_selections_do_not_bleed_between_datasets(gui: Path) -> None
     try:
         window.comboBox_datasetGroup.setCurrentText("Terrain")
         window.variable_inputs["elevation"].setChecked(True)
-        window.credential_inputs["earthdata_username"].setText("someone")
         window.comboBox_datasetGroup.setCurrentText("Climate")
         window.datasetCombo.setCurrentIndex(window.datasetCombo.findData("era5_land"))
         window.credential_inputs["cds_api_key"].setText("other")
@@ -128,8 +127,7 @@ def test_per_dataset_selections_do_not_bleed_between_datasets(gui: Path) -> None
     try:
         restored.comboBox_datasetGroup.setCurrentText("Terrain")
         assert restored.variable_inputs["elevation"].isChecked()
-        assert restored.credential_inputs["earthdata_username"].text() == "someone"
-        assert restored.credential_inputs["earthdata_password"].text() == ""
+        assert restored.credential_inputs == {}
     finally:
         restored.close()
 

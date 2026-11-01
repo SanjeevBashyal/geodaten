@@ -45,6 +45,12 @@ def test_qt_designer_form_is_packaged_and_contains_download_inputs() -> None:
     variable_layout = variable_host.find("./layout")
     assert variable_layout is not None
     assert variable_layout.attrib == {"class": "QGridLayout", "name": "variableLayout"}
+    group_combo = next(
+        element
+        for element in root.iter("widget")
+        if element.attrib.get("name") == "comboBox_datasetGroup"
+    )
+    assert group_combo.findtext("./property[@name='currentIndex']/number") == "0"
 
 
 def test_dataset_specs_match_the_designer_groups() -> None:
@@ -54,14 +60,15 @@ def test_dataset_specs_match_the_designer_groups() -> None:
     assert groups == {
         "soilgrids": "Soil",
         "srtm": "Terrain",
+        "hydrosheds": "Terrain",
+        "esa_worldcover": "Land Use",
         "glc_fcs30d": "Land Use",
         "glim": "Geology",
         "gimms_lai4g": "LAI",
         "modis_lai": "LAI",
         "copernicus_lai": "LAI",
-        "nex_gddp_cmip6": "Climate",
-        "ifs_fesom": "Climate",
         "era5_land": "Climate",
+        "nex_gddp_cmip6": "Climate",
         "sentinel2": "Imagery",
         "landsat9": "Imagery",
     }
@@ -111,11 +118,11 @@ def test_qt_controller_filters_datasets_and_builds_requests(monkeypatch) -> None
         assert tuple(
             window.datasetCombo.itemData(index)
             for index in range(window.datasetCombo.count())
-        ) == ("nex_gddp_cmip6", "ifs_fesom", "era5_land")
+        ) == ("era5_land", "nex_gddp_cmip6")
         assert window.groupBox_temporalExtent.isEnabled()
         assert window.dateEdit_startDate.text() == "Earliest"
         assert window.dateEdit_endDate.text() == "Latest"
-        window.variable_inputs["hurs"].setChecked(True)
+        window.variable_inputs["t2m"].setChecked(True)
         window.checkBox_earliest.setChecked(False)
         window.checkBox_latest.setChecked(False)
         window.dateEdit_startDate.setDate(window.dateEdit_startDate.date().addYears(-1))
@@ -125,6 +132,12 @@ def test_qt_controller_filters_datasets_and_builds_requests(monkeypatch) -> None
             "yyyy-MM-dd"
         )
         assert climate_request.time.end == window.dateEdit_endDate.date().toString("yyyy-MM-dd")
+
+        window.comboBox_datasetGroup.setCurrentText("Land Use")
+        assert tuple(
+            window.datasetCombo.itemData(index)
+            for index in range(window.datasetCombo.count())
+        ) == ("esa_worldcover", "glc_fcs30d")
 
         options = ProviderOptionsDialog(get_provider("nex_gddp_cmip6").spec, {})
         assert options._read() == {}

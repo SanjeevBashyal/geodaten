@@ -292,7 +292,8 @@ class DownloadWindow(QMainWindow):
     def _dataset_changed(self) -> None:
         # The outgoing dataset's widgets are about to be destroyed, so remember
         # what was chosen in them before they go.
-        self._capture_dataset_state(self._current_dataset)
+        if self._current_dataset is not None:
+            self._capture_dataset_state(self._current_dataset)
         _clear_layout(self.variableLayout)
         _clear_layout(self.credentialLayout)
         self.variable_inputs.clear()

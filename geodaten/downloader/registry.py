@@ -12,14 +12,15 @@ from geodaten.downloader.base import Provider
 _BUILTINS: dict[str, tuple[str, str]] = {
     "soilgrids": ("geodaten.downloader.soilgrids", "SoilGridsProvider"),
     "srtm": ("geodaten.downloader.srtm", "SrtmProvider"),
+    "hydrosheds": ("geodaten.downloader.hydrosheds", "HydroShedsProvider"),
+    "esa_worldcover": ("geodaten.downloader.esa_worldcover", "EsaWorldCoverProvider"),
     "glc_fcs30d": ("geodaten.downloader.glc_fcs30d", "GlcFcs30dProvider"),
     "glim": ("geodaten.downloader.glim", "GlimProvider"),
     "gimms_lai4g": ("geodaten.downloader.gimms_lai4g", "GimmsLai4gProvider"),
     "modis_lai": ("geodaten.downloader.modis_lai", "ModisLaiProvider"),
     "copernicus_lai": ("geodaten.downloader.copernicus_lai", "CopernicusLaiProvider"),
-    "nex_gddp_cmip6": ("geodaten.downloader.nex_gddp_cmip6", "NexGddpProvider"),
-    "ifs_fesom": ("geodaten.downloader.ifs_fesom", "IfsFesomProvider"),
     "era5_land": ("geodaten.downloader.era5_land", "Era5LandProvider"),
+    "nex_gddp_cmip6": ("geodaten.downloader.nex_gddp_cmip6", "NexGddpProvider"),
     "sentinel2": ("geodaten.downloader.stac_imagery", "Sentinel2Provider"),
     "landsat9": ("geodaten.downloader.stac_imagery", "Landsat9Provider"),
 }
